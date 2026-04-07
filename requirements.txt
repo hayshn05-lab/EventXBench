@@ -1,0 +1,15 @@
+pandas>=1.5
+numpy>=1.23
+datasets>=2.14
+huggingface-hub>=0.17
+# ML baselines
+lightgbm>=3.3
+optuna>=3.0
+# LLM baselines
+openai>=1.0
+anthropic>=0.18
+# T2 embedding baseline
+sentence-transformers>=2.2
+faiss-cpu>=1.7
+# Evaluation (optional, metrics work without these)
+scikit-learn>=1.2
