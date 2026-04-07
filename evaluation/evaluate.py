@@ -39,7 +39,7 @@ from evaluation.metrics import (
 #  Helpers                                                            #
 # ------------------------------------------------------------------ #
 
-TASKS = ["t1", "t2", "t3", "t4", "t5", "t6"]
+TASKS = ["t1", "t2", "t3", "t4", "t5", "t6", "t7"]
 
 PREDICTION_FILE_NAMES = {
     "t1": "t1_predictions.jsonl",
@@ -48,6 +48,7 @@ PREDICTION_FILE_NAMES = {
     "t4": "t4_predictions.jsonl",
     "t5": "t5_predictions.jsonl",
     "t6": "t6_predictions.jsonl",
+    "t7": "t7_predictions.jsonl",
 }
 
 
@@ -87,7 +88,7 @@ def _load_gold(task: str, gold_path: Optional[str]) -> List[Dict[str, Any]]:
 # ------------------------------------------------------------------ #
 
 T1_LABELS = ["high_interest", "moderate_interest", "low_interest"]
-T5_LABELS = ["transient", "sustained", "reversal"]
+T7_LABELS = ["transient", "sustained", "reversal"]
 T6_LABELS = ["no_cross_market_effect", "primary_mover", "propagated_signal"]
 
 
@@ -189,6 +190,40 @@ def evaluate_t4(preds: List[dict], gold: List[dict]) -> Dict[str, Any]:
 
 
 def evaluate_t5(preds: List[dict], gold: List[dict]) -> Dict[str, Any]:
+    """T5: Continuous prediction of price_impact and volume_multiplier."""
+    gold_map: dict[str, dict] = {}
+    for g in gold:
+        key = f"{g['tweet_id']}_{g['condition_id']}"
+        gold_map[key] = g
+
+    pi_true, pi_pred = [], []
+    vm_true, vm_pred = [], []
+    for p in preds:
+        key = f"{p['tweet_id']}_{p['condition_id']}"
+        if key not in gold_map:
+            continue
+        g = gold_map[key]
+        # price_impact: max absolute deviation from p0 (use 2h horizon as default)
+        g_pi = g.get("price_impact_json", {})
+        p_pi = p.get("price_impact")
+        if p_pi is not None and g_pi:
+            pi_true.append(float(g_pi.get("2h", 0)))
+            pi_pred.append(float(p_pi))
+        # volume_multiplier
+        g_vm = g.get("volume_multiplier_json", {})
+        p_vm = p.get("volume_multiplier")
+        if p_vm is not None and g_vm:
+            vm_true.append(float(g_vm.get("2h", 0)))
+            vm_pred.append(float(p_vm))
+
+    result: Dict[str, Any] = {"task": "t5", "n_price_impact": len(pi_true), "n_volume_multiplier": len(vm_true)}
+    result["spearman_rho_price_impact"] = round(spearman_rho(pi_true, pi_pred), 4) if len(pi_true) >= 2 else None
+    result["spearman_rho_volume_multiplier"] = round(spearman_rho(vm_true, vm_pred), 4) if len(vm_true) >= 2 else None
+    return result
+
+
+def evaluate_t7(preds: List[dict], gold: List[dict]) -> Dict[str, Any]:
+    """T7: Decay classification (transient/sustained/reversal)."""
     gold_map: dict[str, str] = {}
     for g in gold:
         key = f"{g['tweet_id']}_{g['condition_id']}"
@@ -202,9 +237,9 @@ def evaluate_t5(preds: List[dict], gold: List[dict]) -> Dict[str, Any]:
             y_pred.append(p["label"])
 
     return {
-        "task": "t5",
+        "task": "t7",
         "n": len(y_true),
-        "macro_f1": round(macro_f1(y_true, y_pred, labels=T5_LABELS), 4),
+        "macro_f1": round(macro_f1(y_true, y_pred, labels=T7_LABELS), 4),
     }
 
 
@@ -234,6 +269,7 @@ EVALUATORS = {
     "t4": evaluate_t4,
     "t5": evaluate_t5,
     "t6": evaluate_t6,
+    "t7": evaluate_t7,
 }
 
 

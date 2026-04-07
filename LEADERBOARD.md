@@ -76,21 +76,37 @@ Results reported on the standard test splits. All classification metrics are mac
 | Qwen3.5-27B (0-shot) | 0.623 | 0.448 | 0.037 |
 | Qwen3.5-27B (3-shot) | 0.619 | 0.449 | 0.118 |
 
-### T5: Volume and Price Impact
+### T5: Volume and Price Impact (Continuous)
 
-| Model | rho (price) | rho (volume) | Decay Macro-F1 |
-|-------|-------------|--------------|----------------|
-| LightGBM | 0.343 | 0.363 | **0.518** |
-| GPT-4o (0-shot) | 0.056 | -0.039 | 0.296 |
-| GPT-4o + prices | 0.268 | -0.046 | 0.285 |
-| Sonnet 4.5 (0-shot) | 0.308 | 0.073 | 0.277 |
-| Sonnet 4.5 (3-shot) | **0.417** | **0.211** | 0.251 |
-| Grok 4.1 (0-shot) | 0.176 | -0.054 | 0.284 |
-| Grok 4.1 (3-shot) | 0.135 | 0.019 | 0.273 |
-| Qwen3.5-4B (0-shot) | -0.038 | -0.122 | 0.309 |
-| Qwen3.5-4B (3-shot) | 0.067 | 0.068 | 0.303 |
-| Qwen3.5-27B (0-shot) | 0.179 | 0.078 | 0.290 |
-| Qwen3.5-27B (3-shot) | 0.331 | 0.162 | 0.320 |
+| Model | rho (price_impact) | rho (volume_multiplier) |
+|-------|-------------------|------------------------|
+| LightGBM | 0.343 | 0.363 |
+| GPT-4o (0-shot) | 0.056 | -0.039 |
+| GPT-4o + prices | 0.268 | -0.046 |
+| Sonnet 4.5 (0-shot) | 0.308 | 0.073 |
+| Sonnet 4.5 (3-shot) | **0.417** | **0.211** |
+| Grok 4.1 (0-shot) | 0.176 | -0.054 |
+| Grok 4.1 (3-shot) | 0.135 | 0.019 |
+| Qwen3.5-4B (0-shot) | -0.038 | -0.122 |
+| Qwen3.5-4B (3-shot) | 0.067 | 0.068 |
+| Qwen3.5-27B (0-shot) | 0.179 | 0.078 |
+| Qwen3.5-27B (3-shot) | 0.331 | 0.162 |
+
+### T7: Impact Persistence (Decay Classification)
+
+| Model | Macro-F1 |
+|-------|----------|
+| LightGBM | **0.518** |
+| GPT-4o (0-shot) | 0.296 |
+| GPT-4o + prices | 0.285 |
+| Sonnet 4.5 (0-shot) | 0.277 |
+| Sonnet 4.5 (3-shot) | 0.251 |
+| Grok 4.1 (0-shot) | 0.284 |
+| Grok 4.1 (3-shot) | 0.273 |
+| Qwen3.5-4B (0-shot) | 0.309 |
+| Qwen3.5-4B (3-shot) | 0.303 |
+| Qwen3.5-27B (0-shot) | 0.290 |
+| Qwen3.5-27B (3-shot) | 0.320 |
 
 ### T6: Cross-Market Propagation
 

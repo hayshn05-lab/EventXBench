@@ -4,7 +4,7 @@
 [![Paper](https://img.shields.io/badge/Paper-ACM%20MM%20'26-red)](https://doi.org/PLACEHOLDER)
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
 
-**EventX** is a multimodal benchmark connecting 9M Twitter/X posts from 1,152 KOL accounts to 11,952 Polymarket prediction markets (2021--2026). It defines six tasks across two tiers: **resolution** (human-annotated ground truth) and **forecast** (deterministic labels from post-publication tick data).
+**EventX** is a multimodal benchmark connecting 9M Twitter/X posts from 1,152 KOL accounts to 11,952 Polymarket prediction markets (2021--2026). It defines seven tasks across two tiers: **resolution** (human-annotated ground truth) and **forecast** (deterministic labels from post-publication tick data).
 
 ## Quick Start
 
@@ -29,8 +29,9 @@ python evaluation/evaluate.py --task t1 --predictions results/t1_predictions.jso
 | T2 | Post-to-Market Linking | Resolution | Market ID or `none` | 815 | Accuracy@1, MRR |
 | T3 | Evidence Grading | Resolution | Ordinal 0--5 | 342,552 | QWK (kappa), macro-F1 |
 | T4 | Market Movement Prediction | Forecast | Direction x Magnitude | 4,803 | Dir-Acc, Mag-F1, Spearman rho |
-| T5 | Volume & Price Impact | Forecast | Continuous + 3-class | 407 (268 clean) | Spearman rho (price, volume), decay F1 |
+| T5 | Volume & Price Impact | Forecast | Continuous | 407 (268 clean) | Spearman rho (price_impact, volume_multiplier) |
 | T6 | Cross-Market Propagation | Forecast | 3-class | 4,006 | Macro-F1, MAE (onset lag) |
+| T7 | Impact Persistence (Decay) | Forecast | 3-class (`transient`/`sustained`/`reversal`) | 407 (268 clean) | Macro-F1 |
 
 ## Tasks
 
@@ -61,12 +62,19 @@ Predict direction and magnitude of the YES-price change at 2-hour horizon after 
 - **Metrics**: Direction accuracy, Magnitude macro-F1, Spearman rho on continuous delta curve
 - **Secondary horizons**: 30 min, 6 h
 
-### T5: Volume and Price Impact (Decay)
-Predict three targets per post: (i) `price_impact` (max |deviation| from p0), (ii) `volume_multiplier` (total volume / 24h baseline), (iii) `decay_class`.
+### T5: Volume and Price Impact
+Predict two continuous targets per post: (i) `price_impact` (max absolute deviation from p0), (ii) `volume_multiplier` (total volume / 24h baseline).
 
-- **Decay labels**: `transient` (|delta_2h| < 30% of |delta_15m|), `sustained` (same sign, larger), `reversal` (sign flips at 2h)
-- **Metrics**: Spearman rho for price_impact and volume_multiplier, decay macro-F1
-- **Note**: In the codebase this task uses `task5+7/` directories and `t7_` prefixes. See [`baselines/t7/`](baselines/t7/) for the naming note.
+- **Targets**: `price_impact` (continuous), `volume_multiplier` (continuous)
+- **Metrics**: Spearman rho for each target
+- **Note**: T5 and T7 share the same underlying data (`task5+7/` in the codebase). T5 evaluates the continuous predictions; T7 evaluates the decay classification.
+
+### T7: Impact Persistence (Decay)
+Classify whether a tweet's initial market impact is transient, sustained, or reverses over time.
+
+- **Labels**: `transient` (|delta_2h| < 30% of |delta_15m|), `sustained` (same sign, larger), `reversal` (sign flips at 2h)
+- **Metrics**: Macro-F1
+- **Note**: Uses the same data as T5 but evaluates the `decay_class` field. In the codebase, uses `task5+7/` directories and `t7_` prefixes.
 
 ### T6: Cross-Market Propagation
 Predict whether a tweet's market impact propagates to sibling markets within 2 hours. A sibling is deemed "moved" if |delta_p| > 1.5 sigma (rolling 24h stdev).
@@ -103,8 +111,9 @@ See [`data/README.md`](data/README.md) for the full dataset card.
 | `t2_groundtruth.jsonl` | T2 post-market linking pairs | 815 |
 | `t3_graded.json` | T3 evidence grades (0--5) | 342,552 |
 | `t4_labels.jsonl` | T4 direction x magnitude labels | 4,803 |
-| `t5_labels.jsonl` | T5 price impact + decay labels | 407 |
+| `t5_labels.jsonl` | T5 price impact + volume multiplier | 407 |
 | `t6_labels.jsonl` | T6 cross-market propagation labels | 4,006 |
+| `t7_labels.jsonl` | T7 decay class labels (same data as T5) | 407 |
 
 ### Privacy
 
@@ -171,7 +180,7 @@ EventXBench/
 │   └── README.md                 # Hugging Face dataset card
 ├── baselines/
 │   ├── t1/ ... t6/               # Per-task baselines (LLM, ML, basic)
-│   └── t7/                       # Pointer to T5 (code naming note)
+│   └── t7/                       # Impact Persistence (Decay) baselines
 ├── evaluation/
 │   ├── evaluate.py               # Unified evaluation CLI
 │   ├── metrics.py                # Metric implementations

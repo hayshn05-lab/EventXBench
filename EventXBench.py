@@ -41,6 +41,8 @@ _URLS = {
     "t5_test": "data/t5/test.jsonl",
     "t6_train": "data/t6/train.jsonl",
     "t6_test": "data/t6/test.jsonl",
+    "t7_train": "data/t7/train.jsonl",
+    "t7_test": "data/t7/test.jsonl",
 }
 
 
@@ -86,6 +88,11 @@ class EventXBench(datasets.GeneratorBasedBuilder):
             name="t6",
             version=VERSION,
             description="T6: Cross-Market Propagation (3-class)",
+        ),
+        EventXBenchConfig(
+            name="t7",
+            version=VERSION,
+            description="T7: Impact Persistence / Decay classification (3-class)",
         ),
     ]
 

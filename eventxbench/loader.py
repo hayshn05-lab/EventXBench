@@ -17,7 +17,7 @@ import pandas as pd
 # Default HF repo -- update after publishing
 HF_REPO = "mlsys-io/EventXBench"
 
-VALID_TASKS = {"t1", "t2", "t3", "t4", "t5", "t6"}
+VALID_TASKS = {"t1", "t2", "t3", "t4", "t5", "t6", "t7"}
 
 
 def load_task(
@@ -83,6 +83,7 @@ _HF_LAYOUT = {
     "t4": {"train": "t4/train.jsonl", "test": "t4/test.jsonl"},
     "t5": {"train": "t5/train.jsonl", "test": "t5/test.jsonl"},
     "t6": {"train": "t6/train.jsonl", "test": "t6/test.jsonl"},
+    "t7": {"train": "t7/train.jsonl", "test": "t7/test.jsonl"},
 }
 
 # Original raw layout from EventX/ directory
@@ -96,6 +97,7 @@ _RAW_LAYOUT = {
     "t4": {"full": "task4/t4_labels.jsonl"},
     "t5": {"full": "task5+7/t5(7)_label.jsonl"},
     "t6": {"full": "task6/task6_labels_v2_tuned_t35confound_full.jsonl"},
+    "t7": {"full": "task5+7/t5(7)_label.jsonl"},
 }
 
 
