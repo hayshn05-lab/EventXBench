@@ -1,54 +1,58 @@
 # EventX: A Multimodal Benchmark Linking Social Media Posts to Prediction Market Dynamics
 
-**Dataset: [https://huggingface.co/datasets/mlsys-io/EventXBench](https://huggingface.co/datasets/mlsys-io/EventXBench)**
+**Hosted snapshot (gated; currently legacy schema): [mlsys-io/EventXBench](https://huggingface.co/datasets/mlsys-io/EventXBench)**
 
 [![Dataset on HF](https://img.shields.io/badge/%F0%9F%A4%97%20Dataset-EventXBench-blue)](https://huggingface.co/datasets/mlsys-io/EventXBench)
 [![Paper](https://img.shields.io/badge/Paper-ACM%20MM%20'26-red)](https://doi.org/PLACEHOLDER)
 [![License: CC BY-NC 4.0](https://img.shields.io/badge/License-CC%20BY--NC%204.0-lightgrey.svg)](https://creativecommons.org/licenses/by-nc/4.0/)
 
-**EventX** is a multimodal benchmark connecting 9M Twitter/X posts from 1,152 KOL accounts to 11,952 Polymarket prediction markets (2021--2026). It defines seven tasks across two tiers: **resolution** (human-annotated ground truth) and **forecast** (deterministic labels from post-publication tick data).
+**EventX** is a multimodal benchmark connecting Twitter/X posts to Polymarket prediction-market dynamics. The current release defines six canonical tasks across two tiers: **resolution** (human-reviewed ground truth) and **forecast** (causally constructed labels from later market data). The July 2026 KDD releases use versioned, leakage-audited temporal splits.
 
 ## Quick Start
 
 ```bash
 pip install -r requirements.txt
 
-from eventxbench import load_task
-train, test = load_task("t1")  # Returns pandas DataFrames
+# After unpacking the dated July 2026 release bundle
+python -m baselines.t1.basic_baseline \
+  --local-dir KDD/data/t1_kdd_v2 \
+  --output results/predictions.jsonl
 
-# Run a baseline
-python baselines/t1/llm_baseline.py --provider openai --model gpt-4o --shots 0
-
-# Evaluate predictions
-python evaluation/evaluate.py --task t1 --predictions results/t1_predictions.jsonl
+# The runner writes majority and random-prior files with explicit prefixes.
+# Evaluate the majority baseline against the same frozen release:
+python evaluation/evaluate.py --task t1 \
+  --predictions results/t1_majority_predictions.jsonl \
+  --gold KDD/data/t1_kdd_v2/test.jsonl
 ```
 
 ## Benchmark Overview
 
 | Task | Name | Tier | Output | Primary Metrics |
 |------|------|------|--------|-----------------|
-| T1 | Market Volume Prediction | Forecast | 3-class (`high`/`moderate`/`low`) | Macro-F1, `high`-class P@K |
-| T2 | Post-to-Market Linking | Resolution | Market ID or `none` | Accuracy@1, MRR |
+| T1 | Market Volume Prediction | Forecast | 3-class interest label | Macro-F1, `high_interest` P@K |
+| T2 | Post-to-Market Linking | Resolution | Market ID or `NONE` | Accuracy@1, MRR, `NONE` F1 |
 | T3 | Evidence Grading | Resolution | Ordinal 0--5 | QWK (kappa), macro-F1 |
-| T4 | Market Movement Prediction | Forecast | Direction x Magnitude | Dir-Acc, Mag-F1, Spearman rho |
-| T5 | Volume & Price Impact | Forecast | Continuous | Spearman rho (price_impact, volume_multiplier) |
-| T6 | Cross-Market Propagation | Forecast | 3-class | Macro-F1, MAE (onset lag) |
-| T7 | Impact Persistence (Decay) | Forecast | 3-class (`transient`/`sustained`/`reversal`) | Macro-F1 |
+| T4 | Daily Market Movement | Forecast | Direction, magnitude, 1/3/7-day deltas | Dir-Acc, Mag-F1, Spearman rho by horizon |
+| T5 | Forward Drift & Persistence | Forecast | 1/3/7-day drift/volume plus decay class | Spearman rho by horizon, decay Macro-F1 |
+| T6 | Cross-Market Co-Movement | Forecast | 3-class by 1/3/7-day horizon | Macro-F1, accuracy |
 
 ## Tasks
 
 ### T1: Conditional Market Volume Prediction
-Predict the final trading-volume percentile of a subsequently created market, given pre-market social signals.
+Predict a market's lifetime-volume interest class from market metadata and social signals available before market creation.
 
-- **Labels**: `high` (>80th pctl), `moderate` (40th--80th), `low` (<40th)
-- **Input**: Tweet cluster features, event metadata, temporal features
-- **Metrics**: Macro-F1, `high`-class precision@K
+- **Release**: `t1.kdd.v2`; 709 train and 275 test markets
+- **Labels**: `high_interest`, `moderate_interest`, `low_interest`
+- **Input**: Market text/metadata plus the manifest-approved pre-market social feature rung
+- **Metrics**: Macro-F1, accuracy, `high_interest` precision@K
 
 ### T2: Post-to-Market Linking
-Given a tweet and a candidate set recalled by BGE-large-en-v1.5 / FAISS dense retrieval, identify which market the post addresses (or `none`).
+Given a post and a frozen contextual candidate set, rank the matching market or select `NONE`.
 
-- **Input**: Tweet text + candidate market questions
-- **Metrics**: Accuracy@1, MRR, `none`-class F1
+- **Release**: `t2.gold.r3.contextual.v1`; 544 train, 2,500 validation, and 2,500 test rows
+- **Input**: Post text plus candidate questions, resolution rules, and domains
+- **Metrics**: Accuracy@1, MRR, `NONE` F1, and candidate recall
+- **Protocol**: Thresholds are selected on training/validation only; test labels are sealed
 
 ### T3: Evidence Grading and Resolution Potential
 Assign an ordinal evidence grade (0--5) to each post-market pair.
@@ -57,65 +61,96 @@ Assign an ordinal evidence grade (0--5) to each post-market pair.
 - **Metrics**: Quadratic-weighted kappa, `resolving`-class precision, macro-F1
 
 ### T4: Market Movement Prediction
-Predict direction and magnitude of the YES-price change at 2-hour horizon after a tweet.
+Predict forward YES-price movement for a market-day post bundle.
 
-- **Direction**: `up` (delta > 0.02), `down` (delta < -0.02), `flat` (otherwise)
-- **Magnitude**: `large` (>8%), `medium` (2--8%), `small` (<=2%)
-- **Metrics**: Direction accuracy, Magnitude macro-F1, Spearman rho on continuous delta curve
-- **Secondary horizons**: 30 min, 6 h
+- **Release**: `t4.kdd.v2`; 2,875 train, 2,268 validation, and 5,791 test rows
+- **Unit**: `(condition_id, bundle_day)` with a decision time at the end of the UTC day
+- **Targets**: Direction, magnitude, and continuous deltas at 1, 3, and 7 days
+- **Metrics**: Direction accuracy, magnitude macro-F1, and Spearman rho by horizon
 
-### T5: Volume and Price Impact
-Predict two continuous targets per post: (i) `price_impact` (max absolute deviation from p0), (ii) `volume_multiplier` (total volume / 24h baseline).
+### T5: Forward Drift Magnitude and Persistence
+Predict the forward behavior of the non-flat T4 market-day subset.
 
-- **Targets**: `price_impact` (continuous), `volume_multiplier` (continuous)
-- **Metrics**: Spearman rho for each target
-- **Note**: T5 and T7 share the same underlying data (`task5+7/` in the codebase). T5 evaluates the continuous predictions; T7 evaluates the decay classification.
+- **Release**: `t5.kdd.v2`; 889 train, 692 validation, and 1,761 test rows
+- **Targets**: Drift magnitude and volume multiplier at 1, 3, and 7 days, plus `transient`/`sustained`/`reversal`
+- **Metrics**: Spearman rho for every continuous horizon and decay macro-F1
+- **Compatibility**: The legacy `t7` config remains an alias for older decay-only data; canonical results use T5
 
-### T7: Impact Persistence (Decay)
-Classify whether a tweet's initial market impact is transient, sustained, or reverses over time.
+### T6: Cross-Market Co-Movement
+Forecast whether a primary market and its causally visible sibling markets co-move over a daily horizon.
 
-- **Labels**: `transient` (|delta_2h| < 30% of |delta_15m|), `sustained` (same sign, larger), `reversal` (sign flips at 2h)
-- **Metrics**: Macro-F1
-- **Note**: Uses the same data as T5 but evaluates the `decay_class` field. In the codebase, uses `task5+7/` directories and `t7_` prefixes.
-
-### T6: Cross-Market Propagation
-Predict whether a tweet's market impact propagates to sibling markets within 2 hours. A sibling is deemed "moved" if |delta_p| > 1.5 sigma (rolling 24h stdev).
-
-- **Labels**: `no_effect`, `primary_mover` (primary market moves first, sibling follows), `propagated_signal` (sibling moves before or instead of primary)
-- **Metrics**: Macro-F1, MAE on onset lag (minutes)
+- **Release**: `t6.kdd.v2`; 766 train, 1,225 validation, and 2,592 test rows
+- **Unit**: `(condition_id, bundle_day, horizon_days)` for 1, 3, and 7 days
+- **Labels**: `no_effect`, `primary_only`, `cross_market`
+- **Metrics**: Macro-F1 and accuracy overall/by horizon; four-way class and cascade-size metrics are analysis-only
+- **Protocol**: Only prediction-time schema fields are model inputs; legacy intraday graph scripts are not v2 baselines
 
 ## Data
 
-### Hugging Face Dataset
+### Hosted snapshot
 
-All data is hosted on Hugging Face:
+The linked Hugging Face repository currently requires accepting its access
+conditions and still exposes the earlier T4 `delta_2h`, T5 impact, and T6
+propagation schemas. It is retained for legacy access only and must not be
+used to reproduce the July 2026 v2 results in this branch:
 
 ```python
 from datasets import load_dataset
 
-ds = load_dataset("mlsys-io/EventXBench", "t1")
-
-# Or use our convenience loader
-from eventxbench import load_task
-train, test = load_task("t1")
+legacy_ds = load_dataset("mlsys-io/EventXBench", "t1")
 ```
 
-See [`data/README.md`](data/README.md) for the full dataset card.
+See [`data/README.md`](data/README.md) for the schema card and migration
+status.
 
-### Data Files
+### Canonical July 2026 release data
 
-| File | Description | Size |
-|------|-------------|------|
-| `posts_no_text.jsonl` | Tweet IDs and metadata (text stripped for privacy) | ~9M rows |
-| `market_fundamental.json` | Market metadata (question, category, resolution) | 11,952 markets |
-| `market_ohlcv.json` | Price/volume time series (OHLCV) | 1.8 GB |
-| `t1_labels.jsonl` | T1 ground truth with train/test splits | 326 |
-| `t2_groundtruth.jsonl` | T2 post-market linking pairs | 815 |
+A clean Git checkout contains the baseline code and documentation, not the
+versioned KDD data directories. Obtain the dated
+`*_latest_complete_bundle_20260726` release archives from the benchmark
+release maintainers, verify the included manifest hashes, and pass the
+unpacked directory explicitly, for example
+`--local-dir KDD/data/t1_kdd_v2` or
+`--data-dir KDD/data/t4_kdd_v2`. Do not omit these paths until the hosted v2
+configs have been published.
+
+T2 contextual baselines require auxiliary frozen artifacts that are not a
+single loader split. Point `--data-dir` at a directory with this layout:
+
+```text
+/path/to/t2-release/data/t2/
+|-- gold_r3_contextual_final/
+|   |-- release_manifest.json
+|   |-- val_candidates.jsonl
+|   |-- val_labels.csv
+|   |-- test_candidates.jsonl
+|   `-- test_labels.csv
+|-- t2_contextual_thresholds_q3_p2/
+|   `-- FROZEN_THRESHOLDS.json
+`-- train_silver_contextual_q3_p2/
+    |-- train_labels_final.csv
+    `-- generation_report.json
+```
+
+The T2 LLM runner additionally needs
+`KDD/t2_recall_freeze_m3/frozen_candidates_retrospective.jsonl`; provide it
+with `--train-candidates` when it is not under the repository root. Keep
+test labels sealed for model selection and threshold tuning.
+
+### Canonical Task Splits
+
+| File / config | Description | Size |
+|---------------|-------------|-----:|
+| `t1` (`t1.kdd.v2`) | 709 train / 275 test markets | 984 |
+| `t2` (`t2.gold.r3.contextual.v1`) | 544 train / 2,500 validation / 2,500 test | 5,544 |
 | `t3_graded.json` | T3 evidence grades (0--5) | 342,552 |
-| `t4_labels.jsonl` | T4 direction x magnitude labels | 4,803 |
-| `t5_labels.jsonl` | T5 price impact + volume multiplier | 407 |
-| `t6_labels.jsonl` | T6 cross-market propagation labels | 4,006 |
-| `t7_labels.jsonl` | T7 decay class labels (same data as T5) | 407 |
+| `t4` (`t4.kdd.v2`) | 2,875 train / 2,268 validation / 5,791 test | 10,934 |
+| `t5` (`t5.kdd.v2`) | 889 train / 692 validation / 1,761 test | 3,342 |
+| `t6` (`t6.kdd.v2`) | 766 train / 1,225 validation / 2,592 test | 4,583 |
+
+Versioned KDD directories also contain a `manifest.json` (and, where
+applicable, a schema) that freezes counts, hashes, split policy, allowed input
+features, and forbidden post-decision fields.
 
 ### Privacy
 
@@ -126,71 +161,105 @@ Tweet text is **not** included in the public release to comply with Twitter/X Te
 We provide three baseline families:
 
 ### LLM Baselines
-Zero-shot and few-shot prompting:
-- GPT-4o (OpenAI)
-- Sonnet 4.5 (Anthropic)
-- Grok 4.1 (xAI)
-- Qwen 3.5 (local via vLLM, 4B and 27B)
+Zero-shot and three-shot prompting through OpenAI, Anthropic, xAI, or an
+OpenAI-compatible gateway:
 
 ```bash
-# T1 zero-shot with GPT-4o
-python baselines/t1/llm_baseline.py --provider openai --model gpt-4o --shots 0
+# Inspect a T4 validation prompt without making an API request
+python baselines/t4/llm_baseline.py \
+  --provider openai --model MODEL \
+  --data-dir KDD/data/t4_kdd_v2 \
+  --split validation --shots 0 --dry-run
 
-# T4 three-shot with Claude
-python baselines/t4/llm_baseline.py --provider anthropic --model claude-sonnet-4-5-20250514 --shots 3
+# Run a resumable validation job through an OpenAI-compatible gateway
+python baselines/t6/llm_baseline.py \
+  --provider openai --base-url https://HOST/v1 --model MODEL \
+  --data-dir KDD/data/t6_kdd_v2 \
+  --split validation --shots 3 --resume --output results/t6.validation.jsonl
 ```
 
-**Required env vars**: `OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `XAI_API_KEY`, `HF_TOKEN` (for Qwen)
+Validation/development is the default workflow. Every LLM test run requires
+the explicit `--allow-test` acknowledgement. Few-shot examples come only from
+training/calibration data, temperature is zero, outputs are resumable, and
+reports record prompt/configuration and data hashes. See
+[`baselines/LLM_BASELINE_COMPATIBILITY.md`](baselines/LLM_BASELINE_COMPATIBILITY.md).
+
+**API-key environment variables**: `OPENAI_API_KEY`,
+`ANTHROPIC_API_KEY`, or `XAI_API_KEY`; gateways can select another variable
+with `--api-key-env`.
 
 ### ML Baselines
 LightGBM classifiers with Bayesian hyperparameter tuning (Optuna):
 
 ```bash
-python baselines/t1/lightgbm_baseline.py
-python baselines/t4/lightgbm_baseline.py
+python -m baselines.t1.lightgbm_baseline --local-dir KDD/data/t1_kdd_v2
+python -m baselines.t4.lightgbm_baseline --local-dir KDD/data/t4_kdd_v2
 ```
 
+For the repeated market-day tasks (T4--T6), model-selection folds are
+group-disjoint by `event_cluster_id`, with a row-wise `condition_id` fallback
+when a cluster ID is unavailable. Frozen test rows are never used for tuning.
+
 ### Heuristic & Basic Baselines
-Majority class, random walk, graph heuristics, BM25 retrieval:
+Majority class, random walk, and frozen contextual retrieval:
 
 ```bash
-python baselines/t1/basic_baseline.py
-python baselines/t6/basic_baseline.py
+python -m baselines.t1.basic_baseline --local-dir KDD/data/t1_kdd_v2
+python -m baselines.t2.contextual_baselines \
+  --data-dir /path/to/t2-release/data/t2 \
+  --output-dir results/t2-contextual
+python -m baselines.t6.basic_baseline --local-dir KDD/data/t6_kdd_v2
+```
+
+The T2 contextual runner preserves its CSV tables and report, and also writes
+prediction-only JSONL plus a matching local gold JSONL for the unified
+evaluator:
+
+```bash
+python evaluation/evaluate.py --task t2 \
+  --predictions results/t2-contextual/bge_top1_frozen_threshold.test.predictions.jsonl \
+  --gold results/t2-contextual/t2.test.gold.jsonl
 ```
 
 ## Evaluation
 
 ```bash
-python evaluation/evaluate.py --task t1 --predictions results/t1_preds.jsonl
-python evaluation/evaluate.py --task t4 --predictions results/t4_preds.jsonl
-python evaluation/evaluate.py --task all --predictions-dir results/
+python evaluation/evaluate.py --task t1 \
+  --predictions results/t1_predictions.jsonl \
+  --gold KDD/data/t1_kdd_v2/test.jsonl
+python evaluation/evaluate.py --task t4 \
+  --predictions results/t4_predictions.jsonl \
+  --gold KDD/data/t4_kdd_v2/test.jsonl
 ```
 
-See [`evaluation/README.md`](evaluation/README.md) for prediction format specs.
+The evaluator requires explicit frozen gold by default. See
+[`evaluation/README.md`](evaluation/README.md) for all-task directory naming,
+prediction formats, and the explicit legacy `--hosted-gold` opt-in.
 
 ## Repository Structure
 
 ```
 EventXBench/
-├── README.md
-├── LEADERBOARD.md
-├── requirements.txt
-├── eventxbench/                  # Data loading utilities
-│   ├── __init__.py
-│   └── loader.py
-├── data/
-│   └── README.md                 # Hugging Face dataset card
-├── baselines/
-│   ├── t1/ ... t6/               # Per-task baselines (LLM, ML, basic)
-│   └── t7/                       # Impact Persistence (Decay) baselines
-├── evaluation/
-│   ├── evaluate.py               # Unified evaluation CLI
-│   ├── metrics.py                # Metric implementations
-│   └── README.md
-├── scripts/
-│   └── upload_to_hf.py           # Upload data to Hugging Face
-└── examples/
-    └── quickstart.py
+|-- README.md
+|-- LEADERBOARD.md
+|-- requirements.txt
+|-- eventxbench/                  # Data loading utilities
+|   |-- __init__.py
+|   `-- loader.py
+|-- data/
+|   `-- README.md                 # Dataset schema card
+|-- baselines/
+|   |-- t1/ ... t6/              # Canonical per-task baselines
+|   |-- t7/                       # Legacy decay-only compatibility
+|   `-- LLM_BASELINE_COMPATIBILITY.md
+|-- evaluation/
+|   |-- evaluate.py               # Unified evaluation CLI
+|   |-- metrics.py                # Metric implementations
+|   `-- README.md
+|-- scripts/
+|   `-- upload_to_hf.py           # Hosted-data publishing helper
+`-- examples/
+    `-- quickstart.py
 ```
 
 ## Leaderboard

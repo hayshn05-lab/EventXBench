@@ -1,311 +1,523 @@
 #!/usr/bin/env python3
-"""T5 LLM Baseline -- Impact Persistence (Decay Classification).
+"""T5 KDD-v2 leakage-safe LLM baseline for drift and persistence.
 
-Prompts an LLM with price impact data at multiple horizons to predict the
-decay class (transient / sustained / reversal).  Evaluates Macro-F1.
-
-Note: In the original codebase this task is referred to as T7 / task5+7,
-but in the paper and public release it is T5.
-
-Usage:
-    python -m baselines.t5.llm_baseline --provider openai --model gpt-4o --shots 0
-    python -m baselines.t5.llm_baseline --provider anthropic --model claude-sonnet-4-20250514 --shots 3
+The model sees only market-day fields available at prediction time. Future
+price impacts, volume multipliers, confound flags, and gold labels are never
+placed in target prompts. It predicts every frozen continuous target plus the
+decay class; the prior runner predicted only decay and was not a full T5
+baseline.
 """
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import hashlib
 import json
+import math
 import os
-import re
+import sys
 import time
+import urllib.request
+from pathlib import Path
+from typing import Any
 
 import pandas as pd
 
-import eventxbench
+DECAY_LABELS = ("transient", "sustained", "reversal")
+HORIZONS = ("1d", "3d", "7d")
+DATASET_VERSION = "t5.kdd.v2"
+SPLIT_VERSION = "tier2.temporal.v2"
+PROMPT_VERSION = "t5.kdd.v2.llm.r1"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATA_DIR = REPO_ROOT / "KDD/data/t5_kdd_v2"
+INPUT_FEATURES = (
+    "bundle_day",
+    "price_d",
+    "n_posts",
+    "volume_baseline_14d",
+    "volume_baseline_n_obs",
+)
+TARGET_FIELDS = tuple(
+    [f"drift_magnitude_{h}" for h in HORIZONS]
+    + [f"volume_multiplier_{h}" for h in HORIZONS]
+    + ["decay_class"]
+)
+FORBIDDEN_FEATURES = set(TARGET_FIELDS) | {
+    "delta_1d", "delta_3d", "delta_7d",
+    "price_impact_json", "volume_multiplier_json",
+    "confound_1d", "confound_3d", "confound_7d", "confound_flag",
+}
+SYSTEM_PROMPT = """\
+You forecast post-absorption prediction-market drift using only information
+observable at the end of the UTC bundle day.
 
-DECAY_LABELS = ["transient", "sustained", "reversal"]
-HORIZONS = ["15m", "30m", "1h", "2h", "6h"]
+Predict non-negative absolute drift magnitudes and non-negative volume
+multipliers for 1, 3, and 7 days. Also predict the 1d-to-3d decay class.
 
-# ---------------------------------------------------------------------------
-# Prompt builders
-# ---------------------------------------------------------------------------
-FEW_SHOT_EXAMPLES = [
-    {
-        "price_impacts": {"15m": 0.05, "30m": 0.04, "1h": 0.02, "2h": 0.005, "6h": 0.001},
-        "volume_multipliers": {"15m": 3.2, "30m": 2.1, "1h": 1.3, "2h": 1.0, "6h": 0.9},
-        "decay_class": "transient",
-    },
-    {
-        "price_impacts": {"15m": 0.03, "30m": 0.04, "1h": 0.05, "2h": 0.06, "6h": 0.07},
-        "volume_multipliers": {"15m": 2.0, "30m": 2.5, "1h": 2.8, "2h": 3.0, "6h": 2.5},
-        "decay_class": "sustained",
-    },
-    {
-        "price_impacts": {"15m": 0.06, "30m": 0.03, "1h": -0.01, "2h": -0.04, "6h": -0.05},
-        "volume_multipliers": {"15m": 4.0, "30m": 2.5, "1h": 1.5, "2h": 2.0, "6h": 1.8},
-        "decay_class": "reversal",
-    },
-]
+Definitions:
+- transient: the initial directional move fades substantially by day 3.
+- sustained: the directional move remains material through day 3.
+- reversal: the day-3 move has the opposite sign from the initial move.
 
-TASK_DESCRIPTION = """\
-Task7 targets and definitions:
-1) price_impact_h: max absolute YES-price move from post time to horizon h (non-negative).
-2) volume_multiplier_h: horizon volume divided by baseline volume (non-negative).
-3) decay_class in {transient, sustained, reversal}.
-
-Decay class definitions (important):
-- transient: impact spikes early but clearly fades by later horizons; information effect does not persist.
-- sustained: impact remains meaningfully elevated through later horizons (2h/6h), indicating persistent repricing.
-- reversal: initial impact is later unwound/opposed, i.e., net effect weakens sharply and contradicts early move semantics.
-
-Privacy/data rule:
-- Do not rely on tweet text or market text. Use only the provided numeric horizon signals.
+Return only strict JSON:
+{"drift_magnitude_1d":0.0,"drift_magnitude_3d":0.0,
+ "drift_magnitude_7d":0.0,"volume_multiplier_1d":0.0,
+ "volume_multiplier_3d":0.0,"volume_multiplier_7d":0.0,
+ "decay_class":"transient|sustained|reversal"}
 """
 
 
-def _format_impacts(price_impacts: dict, volume_multipliers: dict) -> str:
-    lines = ["Price impacts by horizon:"]
-    for h in HORIZONS:
-        pi = price_impacts.get(h, "N/A")
-        vm = volume_multipliers.get(h, "N/A")
-        lines.append(f"  {h}: price_impact={pi}, volume_multiplier={vm}")
-    return "\n".join(lines)
-
-
-def _build_prompt_0shot(price_impacts: dict, volume_multipliers: dict) -> str:
-    return (
-        "You are a careful forecasting assistant for Task7 decay classification.\n\n"
-        f"{TASK_DESCRIPTION}\n\n"
-        f"{_format_impacts(price_impacts, volume_multipliers)}\n\n"
-        "Classify decay_class from the numeric trajectory only.\n"
-        "Output requirements:\n"
-        "- Return strict JSON only.\n"
-        "- Exactly one key: decay_class.\n"
-        "- decay_class must be one of transient/sustained/reversal.\n"
-        "Reply with ONLY: {\"decay_class\": \"transient\" | \"sustained\" | \"reversal\"}"
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="T5 daily LLM drift/volume/persistence baseline"
     )
-
-
-def _build_prompt_3shot(price_impacts: dict, volume_multipliers: dict) -> str:
-    lines = [
-        "You are a careful forecasting assistant for Task7 decay classification.",
-        "",
-        TASK_DESCRIPTION,
-        "",
-        "=== Examples ===",
-    ]
-    for ex in FEW_SHOT_EXAMPLES:
-        lines.append(f"\n{_format_impacts(ex['price_impacts'], ex['volume_multipliers'])}")
-        lines.append(f"Decay class: {{\"decay_class\": \"{ex['decay_class']}\"}}")
-    lines += [
-        "",
-        "=== Now classify ===",
-        "",
-        _format_impacts(price_impacts, volume_multipliers),
-        "",
-        "Use numeric signals only (no text assumptions).",
-        "Reply with ONLY: {\"decay_class\": \"transient\" | \"sustained\" | \"reversal\"}",
-    ]
-    return "\n".join(lines)
-
-
-# ---------------------------------------------------------------------------
-# LLM helpers
-# ---------------------------------------------------------------------------
-def _make_client(provider: str):
-    if provider == "openai":
-        from openai import OpenAI
-        api_key = os.environ.get("OPENAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("Set the OPENAI_API_KEY environment variable.")
-        return OpenAI(api_key=api_key)
-    elif provider == "anthropic":
-        import anthropic
-        api_key = os.environ.get("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise RuntimeError("Set the ANTHROPIC_API_KEY environment variable.")
-        return anthropic.Anthropic(api_key=api_key)
-    elif provider == "xai":
-        from openai import OpenAI
-        api_key = os.environ.get("XAI_API_KEY")
-        if not api_key:
-            raise RuntimeError("Set the XAI_API_KEY environment variable.")
-        return OpenAI(api_key=api_key, base_url="https://api.x.ai/v1")
-    else:
-        raise ValueError(f"Unknown provider: {provider}")
-
-
-def _call_llm(client, provider: str, model: str, prompt: str, max_tokens: int = 64) -> str:
-    if provider == "anthropic":
-        resp = client.messages.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=0,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        return resp.content[0].text.strip()
-    else:
-        resp = client.chat.completions.create(
-            model=model,
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0,
-            max_tokens=max_tokens,
-            timeout=60,
-        )
-        return resp.choices[0].message.content.strip()
-
-
-def _parse_decay_class(raw: str) -> str | None:
-    try:
-        obj = json.loads(raw)
-        dc = obj.get("decay_class", "").lower().strip()
-        if dc in DECAY_LABELS:
-            return dc
-    except (json.JSONDecodeError, TypeError, AttributeError):
-        pass
-    for label in DECAY_LABELS:
-        if label in raw.lower():
-            return label
-    return None
-
-
-# ---------------------------------------------------------------------------
-# Metrics
-# ---------------------------------------------------------------------------
-def _macro_f1(y_true: list[str], y_pred: list[str], labels: list[str]) -> float:
-    f1s = []
-    for lab in labels:
-        tp = sum(1 for a, p in zip(y_true, y_pred) if a == lab and p == lab)
-        fp = sum(1 for a, p in zip(y_true, y_pred) if a != lab and p == lab)
-        fn = sum(1 for a, p in zip(y_true, y_pred) if a == lab and p != lab)
-        prec = tp / (tp + fp) if (tp + fp) > 0 else 0.0
-        rec = tp / (tp + fn) if (tp + fn) > 0 else 0.0
-        f1 = (2 * prec * rec / (prec + rec)) if (prec + rec) > 0 else 0.0
-        f1s.append(f1)
-    return sum(f1s) / len(f1s) if f1s else 0.0
-
-
-# ---------------------------------------------------------------------------
-# Data helpers
-# ---------------------------------------------------------------------------
-def _extract_impact_dict(row, prefix: str) -> dict:
-    """Extract horizon dict from either a JSON column or flat columns."""
-    json_col = f"{prefix}_json"
-    if json_col in row.index:
-        val = row[json_col]
-        if isinstance(val, dict):
-            return val
-        if isinstance(val, str):
-            try:
-                return json.loads(val)
-            except (json.JSONDecodeError, TypeError):
-                pass
-    # Try flat columns
-    result = {}
-    for h in HORIZONS:
-        col = f"{prefix}_{h}"
-        if col in row.index and pd.notna(row[col]):
-            result[h] = float(row[col])
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
-def main() -> None:
-    parser = argparse.ArgumentParser(description="T5 LLM decay classification baseline")
     parser.add_argument(
         "--provider",
         choices=["openai", "anthropic", "xai"],
-        default="openai",
+        required=True,
     )
-    parser.add_argument("--model", default="gpt-4o")
-    parser.add_argument("--shots", type=int, default=0, choices=[0, 3])
-    parser.add_argument("--output", default="t5_llm_results.jsonl")
-    parser.add_argument("--delay", type=float, default=0.3)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--base-url", default="")
+    parser.add_argument("--api-key-env", default="")
+    parser.add_argument("--shots", type=int, choices=[0, 3], default=0)
+    parser.add_argument(
+        "--data-dir", "--local-dir", dest="data_dir", type=Path,
+        default=DEFAULT_DATA_DIR,
+    )
+    parser.add_argument(
+        "--split", choices=["validation", "val", "test"], default="validation"
+    )
+    parser.add_argument("--allow-test", action="store_true")
+    parser.add_argument("--output", default="t5_llm_predictions.jsonl")
+    parser.add_argument("--metrics-output", default=None)
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--local-dir", default=None)
-    args = parser.parse_args()
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--retries", type=int, default=2)
+    parser.add_argument("--sleep", type=float, default=0.0)
+    parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument("--disable-thinking", action="store_true")
+    return parser.parse_args()
 
-    # -- Load data ----------------------------------------------------------
-    data = eventxbench.load_task("t5", local_dir=args.local_dir)
-    if isinstance(data, tuple):
-        _, df = data  # use test split
-    else:
-        df = data
 
-    if "decay_class" not in df.columns:
-        raise ValueError("Missing 'decay_class' column in T5 data.")
+def sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    # Filter to valid labels
-    df = df[df["decay_class"].isin(DECAY_LABELS)].reset_index(drop=True)
-    print(f"T5 samples: {len(df)}, model: {args.model}, shots: {args.shots}")
 
-    if not args.dry_run:
-        client = _make_client(args.provider)
+def load_splits(
+    data_dir: Path, split: str
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any], Path, Path]:
+    manifest_path = data_dir / "manifest.json"
+    train_path = data_dir / "train.jsonl"
+    eval_path = data_dir / f"{split}.jsonl"
+    for path in (manifest_path, train_path, eval_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing canonical T5 file: {path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("dataset_version") != DATASET_VERSION:
+        raise ValueError(f"Expected {DATASET_VERSION}")
+    if manifest.get("split_version") != SPLIT_VERSION:
+        raise ValueError(f"Expected {SPLIT_VERSION}")
+    if not manifest.get("release_ready"):
+        raise ValueError("T5 release is not release_ready")
+    train_df = pd.read_json(train_path, lines=True)
+    test_df = pd.read_json(eval_path, lines=True)
+    if len(test_df) != int(manifest["counts"][split]):
+        raise ValueError(f"{split}: row count differs from manifest")
+    # Retain every non-flat T5 row for its available continuous targets.
+    # Decay is nullable when the 3-day comparison is unavailable and is
+    # evaluated only where gold decay_class is present.
+    train_df = train_df.reset_index(drop=True)
+    test_df = test_df.reset_index(drop=True)
+    required = set(INPUT_FEATURES) | set(TARGET_FIELDS) | {
+        "instance_id", "condition_id", "event_cluster_id",
+    }
+    for name, frame in (("train", train_df), (split, test_df)):
+        missing = required - set(frame.columns)
+        if missing:
+            raise ValueError(f"{name}: missing columns {sorted(missing)}")
+        invalid_decay = set(
+            frame["decay_class"].dropna().astype(str)
+        ) - set(DECAY_LABELS)
+        if invalid_decay:
+            raise ValueError(f"{name}: invalid decay labels {sorted(invalid_decay)}")
+    if set(INPUT_FEATURES) & FORBIDDEN_FEATURES:
+        raise AssertionError("Forbidden T5 feature selected")
+    return train_df, test_df, manifest, manifest_path, eval_path
 
-    results: list[dict] = []
-    y_true: list[str] = []
-    y_pred: list[str] = []
-    parse_errors = 0
 
-    for i, (_, row) in enumerate(df.iterrows()):
-        price_impacts = _extract_impact_dict(row, "price_impact")
-        volume_multipliers = _extract_impact_dict(row, "volume_multiplier")
-        gold = str(row["decay_class"])
+def instance_key(row: dict[str, Any]) -> str:
+    if row.get("instance_id"):
+        return str(row["instance_id"])
+    return f"{row['condition_id']}::{row['bundle_day']}"
 
-        prompt = (
-            _build_prompt_0shot(price_impacts, volume_multipliers)
-            if args.shots == 0
-            else _build_prompt_3shot(price_impacts, volume_multipliers)
-        )
 
-        if args.dry_run:
-            print("=== SAMPLE PROMPT ===")
-            print(prompt)
-            print(f"\nGold: {gold}")
-            return
+def _number(row: dict[str, Any], name: str, default: float = 0.0) -> float:
+    value = row.get(name)
+    if value is None or (isinstance(value, float) and math.isnan(value)):
+        return default
+    return float(value)
 
-        try:
-            raw = _call_llm(client, args.provider, args.model, prompt)
-        except Exception as e:
-            print(f"  [API ERROR] row {i}: {e}")
-            time.sleep(5)
-            continue
 
-        pred = _parse_decay_class(raw)
-        if pred is None:
-            parse_errors += 1
-            pred = "transient"  # fallback to majority
+def _feature_block(row: dict[str, Any]) -> str:
+    return (
+        f"bundle_day: {row.get('bundle_day')}\n"
+        f"current_yes_price: {_number(row, 'price_d', 0.5):.6f}\n"
+        f"posts_observed_today: {int(_number(row, 'n_posts'))}\n"
+        f"historical_14d_volume_baseline: "
+        f"{_number(row, 'volume_baseline_14d'):.6f}\n"
+        f"historical_volume_observations: "
+        f"{int(_number(row, 'volume_baseline_n_obs'))}"
+    )
 
-        y_true.append(gold)
-        y_pred.append(pred)
-        results.append(
-            {
-                "tweet_id": str(row.get("tweet_id", i)),
-                "gold": gold,
-                "predicted": pred,
-                "llm_raw": raw,
+
+def build_prompt(
+    row: dict[str, Any], few_shot: list[dict[str, Any]]
+) -> str:
+    parts = [
+        "Task: forecast drift magnitude, volume multiplier, and persistence."
+    ]
+    if few_shot:
+        parts.append("\nTraining examples:")
+        for i, example in enumerate(few_shot, 1):
+            answer = {
+                field: (
+                    str(example[field])
+                    if field == "decay_class"
+                    else _number(example, field)
+                )
+                for field in TARGET_FIELDS
             }
+            parts.append(
+                f"\nExample {i}:\n{_feature_block(example)}\n"
+                f"Answer: {json.dumps(answer, allow_nan=False)}"
+            )
+    parts.append(f"\nTarget:\n{_feature_block(row)}")
+    parts.append("\nReturn strict JSON only.")
+    return "\n".join(parts)
+
+
+def _endpoint(base_url: str, provider: str) -> str:
+    if not base_url:
+        if provider == "anthropic":
+            return "https://api.anthropic.com/v1/messages"
+        if provider == "xai":
+            return "https://api.x.ai/v1/chat/completions"
+        return "https://api.openai.com/v1/chat/completions"
+    base = base_url.rstrip("/")
+    if provider == "anthropic":
+        if base.endswith("/messages"):
+            return base
+        return f"{base}/messages" if base.endswith("/v1") else f"{base}/v1/messages"
+    if base.endswith("/chat/completions"):
+        return base
+    if base.endswith("/v1"):
+        return f"{base}/chat/completions"
+    return f"{base}/v1/chat/completions"
+
+
+def _post_json(
+    url: str, headers: dict[str, str], body: dict[str, Any], timeout: float
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def call_llm(
+    args: argparse.Namespace, api_key: str, prompt: str
+) -> str:
+    url = _endpoint(args.base_url, args.provider)
+    if args.provider == "anthropic":
+        body = {
+            "model": args.model,
+            "max_tokens": 256,
+            "temperature": 0,
+            "system": SYSTEM_PROMPT,
+            "messages": [{"role": "user", "content": prompt}],
+        }
+        headers = {"Content-Type": "application/json", "anthropic-version": "2023-06-01"}
+        if args.base_url:
+            headers["Authorization"] = f"Bearer {api_key}"
+        else:
+            headers["x-api-key"] = api_key
+        response = _post_json(url, headers, body, args.timeout)
+        return "".join(
+            block.get("text", "")
+            for block in response.get("content", [])
+            if block.get("type") == "text"
+        ).strip()
+
+    body = {
+        "model": args.model,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ],
+        "temperature": 0,
+        "max_tokens": 256,
+    }
+    if args.disable_thinking:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+    headers = {"Content-Type": "application/json"}
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    response = _post_json(url, headers, body, args.timeout)
+    return response["choices"][0]["message"]["content"].strip()
+
+
+def parse_prediction(text: str) -> dict[str, Any]:
+    candidate = text.strip()
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        start, end = candidate.find("{"), candidate.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        payload = json.loads(candidate[start : end + 1])
+    prediction: dict[str, Any] = {}
+    for horizon in HORIZONS:
+        for prefix in ("drift_magnitude", "volume_multiplier"):
+            key = f"{prefix}_{horizon}"
+            value = float(payload[key])
+            if not math.isfinite(value) or value < 0:
+                raise ValueError(f"invalid non-negative target {key}: {value}")
+            prediction[key] = value
+    label = str(payload["decay_class"]).lower().strip()
+    if label not in DECAY_LABELS:
+        raise ValueError(f"invalid decay_class: {label}")
+    prediction["decay_class"] = label
+    return prediction
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    with path.open(encoding="utf-8") as handle:
+        return [json.loads(line) for line in handle if line.strip()]
+
+
+def append_jsonl(path: Path, row: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+
+
+def compact_jsonl(
+    path: Path,
+    source_rows: list[dict[str, Any]],
+    latest: dict[str, dict[str, Any]],
+) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for source in source_rows:
+            key = instance_key(source)
+            if key in latest:
+                handle.write(
+                    json.dumps(latest[key], ensure_ascii=False, allow_nan=False)
+                    + "\n"
+                )
+
+
+def main() -> None:
+    args = parse_args()
+    args.split = "validation" if args.split == "val" else args.split
+    if args.split == "test" and not args.allow_test:
+        raise SystemExit("Refusing sealed test run without --allow-test")
+    if args.resume and args.overwrite:
+        raise SystemExit("Choose only one of --resume and --overwrite")
+    train_df, test_df, manifest, manifest_path, eval_path = load_splits(
+        args.data_dir, args.split
+    )
+    if args.limit > 0:
+        test_df = test_df.iloc[: args.limit].copy()
+    # JSON round-trip preserves public JSONL null semantics instead of
+    # pandas' float NaN sentinel, which must never reach rank metrics.
+    train_records = json.loads(
+        train_df.to_json(orient="records", double_precision=15)
+    )
+    test_records = json.loads(
+        test_df.to_json(orient="records", double_precision=15)
+    )
+
+    few_shot: list[dict[str, Any]] = []
+    if args.shots:
+        for label in DECAY_LABELS:
+            matching = sorted(
+                (
+                    row for row in train_records
+                    if row["decay_class"] == label
+                    and all(row.get(field) is not None for field in TARGET_FIELDS)
+                ),
+                key=instance_key,
+            )
+            if not matching:
+                raise ValueError(f"No complete train example for {label}")
+            few_shot.append(matching[0])
+    config = {
+        "version": "t5.llm.baseline.run.v2",
+        "dataset_version": DATASET_VERSION,
+        "split_version": SPLIT_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "provider": args.provider,
+        "model": args.model,
+        "split": args.split,
+        "shots": args.shots,
+        "input_features": list(INPUT_FEATURES),
+        "target_fields": list(TARGET_FIELDS),
+        "few_shot_instance_ids": [instance_key(row) for row in few_shot],
+        "temperature": 0,
+        "thinking_enabled": not args.disable_thinking,
+        "system_prompt_sha256": hashlib.sha256(
+            SYSTEM_PROMPT.encode("utf-8")
+        ).hexdigest(),
+        "runner_sha256": sha256(Path(__file__).resolve()),
+    }
+    run_id = hashlib.sha256(
+        json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    print(
+        f"T5 v2: split={args.split} rows={len(test_records)}, "
+        f"model={args.model}, shots={args.shots}, workers={args.workers}"
+    )
+    print(f"Endpoint: {_endpoint(args.base_url, args.provider)}  Run ID: {run_id}")
+    if args.dry_run:
+        print("\n=== SYSTEM PROMPT ===")
+        print(SYSTEM_PROMPT)
+        print("\n=== PROMPT PREVIEW ===")
+        print(build_prompt(test_records[0], few_shot))
+        return
+
+    env_name = args.api_key_env or {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "xai": "XAI_API_KEY",
+    }[args.provider]
+    api_key = os.environ.get(env_name, "")
+    if not api_key and "localhost" not in args.base_url:
+        raise SystemExit(f"Set {env_name}")
+
+    output_path = Path(args.output)
+    if output_path.exists() and not (args.resume or args.overwrite):
+        raise SystemExit(
+            f"Output exists: {output_path}; use --resume or --overwrite"
         )
+    if args.overwrite and output_path.exists():
+        output_path.unlink()
+    cached = read_jsonl(output_path) if args.resume else []
+    latest = {
+        str(row["instance_id"]): row
+        for row in cached
+        if row.get("instance_id")
+    }
+    for row in latest.values():
+        if row.get("run_id") != run_id:
+            raise SystemExit("Existing output has a different run configuration")
+    completed = {
+        key for key, row in latest.items() if not row.get("error")
+    }
+    pending = [r for r in test_records if instance_key(r) not in completed]
+    print(f"Pending: {len(pending)}; cached successful: {len(completed)}")
 
-        n = len(results)
-        if n % 50 == 0:
-            mf1 = _macro_f1(y_true, y_pred, DECAY_LABELS)
-            print(f"  [{n}/{len(df)}] Macro-F1={mf1:.4f}  parse_errors={parse_errors}")
+    def infer(row: dict[str, Any]) -> dict[str, Any]:
+        prompt = build_prompt(row, few_shot)
+        last_error: Exception | None = None
+        for attempt in range(args.retries + 1):
+            try:
+                raw = call_llm(args, api_key, prompt)
+                prediction = parse_prediction(raw)
+                return {
+                    "instance_id": instance_key(row),
+                    "condition_id": str(row["condition_id"]),
+                    "bundle_day": str(row["bundle_day"]),
+                    "event_cluster_id": str(row["event_cluster_id"]),
+                    **prediction,
+                    "model": args.model,
+                    "shots": args.shots,
+                    "split": args.split,
+                    "run_id": run_id,
+                    "raw_output": raw,
+                }
+            except Exception as exc:
+                last_error = exc
+                if attempt < args.retries:
+                    time.sleep(0.25 * (attempt + 1))
+        return {
+            "instance_id": instance_key(row),
+            "condition_id": str(row["condition_id"]),
+            "bundle_day": str(row["bundle_day"]),
+            "event_cluster_id": str(row["event_cluster_id"]),
+            "split": args.split,
+            "run_id": run_id,
+            "error": {
+                "type": last_error.__class__.__name__ if last_error else "Error",
+                "message": str(last_error),
+            },
+        }
 
-        time.sleep(args.delay)
+    errors = 0
+    with concurrent.futures.ThreadPoolExecutor(
+        max_workers=max(1, args.workers)
+    ) as executor:
+        futures = {executor.submit(infer, row): row for row in pending}
+        for done, future in enumerate(
+            concurrent.futures.as_completed(futures), 1
+        ):
+            result = future.result()
+            errors += int("error" in result)
+            append_jsonl(output_path, result)
+            latest[str(result["instance_id"])] = result
+            if done % 100 == 0 or done == len(pending):
+                print(f"  [{done}/{len(pending)}] errors={errors}")
+            if args.sleep:
+                time.sleep(args.sleep)
 
-    # -- Report -------------------------------------------------------------
-    if results:
-        mf1 = _macro_f1(y_true, y_pred, DECAY_LABELS)
-        print(f"\n=== Results ({args.model}, {args.shots}-shot) ===")
-        print(f"  N={len(results)}, Macro-F1={mf1:.4f}, parse_errors={parse_errors}")
+    compact_jsonl(output_path, test_records, latest)
+    predictions = [
+        row for row in latest.values() if "decay_class" in row
+    ]
+    wanted = {instance_key(row) for row in test_records}
+    predictions = [p for p in predictions if p["instance_id"] in wanted]
 
-        with open(args.output, "w", encoding="utf-8") as f:
-            for r in results:
-                f.write(json.dumps(r, ensure_ascii=False) + "\n")
-        print(f"  Saved predictions -> {args.output}")
+    eventxbench_root = Path(__file__).resolve().parents[2]
+    if str(eventxbench_root) not in sys.path:
+        sys.path.insert(0, str(eventxbench_root))
+    from evaluation.evaluate import evaluate_t5
+
+    metrics = evaluate_t5(predictions, test_records)
+    metrics.update({
+        **config,
+        "run_id": run_id,
+        "status": "complete" if len(predictions) == len(test_records) else "incomplete",
+        "n_errors": errors,
+        "inputs": {
+            "manifest": {"path": str(manifest_path), "sha256": sha256(manifest_path)},
+            "evaluation_split": {"path": str(eval_path), "sha256": sha256(eval_path)},
+        },
+    })
+    print(json.dumps(metrics, indent=2, ensure_ascii=False))
+    metrics_path = (
+        Path(args.metrics_output)
+        if args.metrics_output
+        else output_path.with_suffix(".report.json")
+    )
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    with metrics_path.open("w", encoding="utf-8") as handle:
+        json.dump(metrics, handle, ensure_ascii=False, indent=2, allow_nan=False)
+    print(f"Metrics saved to {metrics_path}")
+    if len(predictions) != len(test_records):
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

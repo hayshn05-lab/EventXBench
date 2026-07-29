@@ -56,6 +56,55 @@ def macro_f1(
 
 
 # ------------------------------------------------------------------ #
+#  Precision at K (positive-class retrieval)                         #
+# ------------------------------------------------------------------ #
+
+
+def precision_at_k(
+    y_true: Sequence[str],
+    scores: Sequence[dict[str, float]],
+    pos_class: str = "high_interest",
+    k: int = 5,
+) -> float:
+    """Precision at K for the positive class.
+
+    Ranks instances by the score of *pos_class* (descending), takes the
+    top-K, and returns the fraction whose true label equals *pos_class*.
+
+    Parameters
+    ----------
+    y_true : sequence of str
+        Ground-truth labels.
+    scores : sequence of dict
+        Per-instance score dicts ``{label: confidence}``.  Must have the
+        same length as *y_true*.
+    pos_class : str
+        The class to treat as positive.
+    k : int
+        Number of top-ranked instances to consider.
+
+    Returns
+    -------
+    float
+        Precision at K in ``[0, 1]``.  Returns 0 when *k* is 0 or when
+        there are fewer than 1 instance(s).
+    """
+    n = len(y_true)
+    if len(scores) != n:
+        raise ValueError("y_true and scores must have the same length")
+    if k <= 0 or n < 1:
+        return 0.0
+    k = min(k, n)
+    ranked = sorted(
+        zip(y_true, scores),
+        key=lambda x: x[1].get(pos_class, 0.0),
+        reverse=True,
+    )
+    topk = ranked[:k]
+    return sum(1 for t, _ in topk if t == pos_class) / k
+
+
+# ------------------------------------------------------------------ #
 #  Accuracy                                                           #
 # ------------------------------------------------------------------ #
 

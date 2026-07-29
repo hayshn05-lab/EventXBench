@@ -8,6 +8,7 @@ optuna>=3.0
 # LLM baselines
 openai>=1.0
 anthropic>=0.18
+requests>=2.28
 # T2 embedding baseline
 sentence-transformers>=2.2
 faiss-cpu>=1.7

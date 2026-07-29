@@ -1,37 +1,37 @@
 #!/usr/bin/env python3
-"""T1 LLM Baseline -- Pre-Market Interest Forecasting
+"""T1 KDD-v2 LLM baseline -- Pre-Market Interest Forecasting.
 
-Classifies prediction-market questions into interest levels
-(high_interest / moderate_interest / low_interest) using either hosted LLMs
-or a local Qwen model through vLLM.
-
-The script is self-contained and follows the repo's baseline conventions:
-- loads Task 1 data via ``eventxbench.load_task("t1")``
-- writes JSONL rows keyed by ``condition_id``
-- prints accuracy and macro-F1 at the end of the run
+Uses the frozen ``t1.kdd.v2`` market-level train/test release and only the
+feature rung declared in its manifest. Test access, including prompt preview,
+is sealed behind ``--allow-test``.
 
 Usage examples:
-    python baselines/t1/llm_baseline.py --provider openai --model gpt-4o --shots 0
-    python baselines/t1/llm_baseline.py --provider anthropic --model claude-3-5-sonnet-20241022 --shots 3
-    python baselines/t1/llm_baseline.py --provider xai --model grok-4-1-fast-non-reasoning
-    python baselines/t1/llm_baseline.py --provider qwen-local --model Qwen/Qwen3.5-4B
-    python baselines/t1/llm_baseline.py --provider openai --dry-run --limit 5
+    python baselines/t1/llm_baseline.py \
+        --provider openai --model MODEL --split train --dry-run --limit 1
+
+    python baselines/t1/llm_baseline.py \
+        --provider openai --base-url https://lum.id/llm \
+        --api-key-env LUMID_API_KEY --model MODEL --split test --allow-test \
+        --shots 3 --resume --output results/t1.MODEL.test.3shot.jsonl
+
+API keys are read from environment variables (OPENAI_API_KEY / ANTHROPIC_API_KEY,
+or the variable selected with --api-key-env).
 """
 from __future__ import annotations
 
 import argparse
-import concurrent.futures
+import hashlib
 import json
 import os
 import re
-import sys
 import time
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 import pandas as pd
+from sklearn.metrics import accuracy_score, f1_score
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -39,16 +39,14 @@ import pandas as pd
 
 LABEL_ORDER = ["high_interest", "moderate_interest", "low_interest"]
 VALID_LABELS = set(LABEL_ORDER)
+DATASET_VERSION = "t1.kdd.v2"
+PROMPT_VERSION = "t1.kdd.v2.llm.r1"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_DATA_DIR = REPO_ROOT / "KDD/data/t1_kdd_v2"
 
 OPENAI_API_URL = "https://api.openai.com/v1/chat/completions"
 ANTHROPIC_API_URL = "https://api.anthropic.com/v1/messages"
-XAI_API_URL = "https://api.x.ai/v1/responses"
-
-DEFAULT_OPENAI_MODEL = "gpt-4o"
-DEFAULT_ANTHROPIC_MODEL = "claude-3-5-sonnet-20241022"
-DEFAULT_XAI_MODEL = "grok-4-1-fast-non-reasoning"
-DEFAULT_QWEN_MODEL = "Qwen/Qwen3.5-4B"
-DEFAULT_OUTPUT = "t1_llm_predictions.jsonl"
+XAI_API_URL = "https://api.x.ai/v1/chat/completions"
 
 SYSTEM_PROMPT = """\
 You are evaluating a benchmark task: Pre-Market Interest Forecasting.
@@ -80,23 +78,6 @@ Return strict JSON only (no explanation) in exactly this format:
 }
 """
 
-FEATURE_COLUMNS = [
-    "score",
-    "cluster_count",
-    "linked_tweet_count",
-    "avg_link_confidence",
-    "max_link_confidence",
-    "text_similarity",
-    "tweet_count",
-    "unique_user_count",
-    "burst_duration_hours",
-    "max_author_followers",
-    "mean_author_followers",
-    "median_author_followers",
-    "high_follower_author_count",
-]
-
-
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -108,102 +89,69 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--provider",
-        choices=["openai", "anthropic", "xai", "qwen", "qwen-local"],
+        choices=["openai", "anthropic", "xai"],
         required=True,
         help="LLM provider",
     )
-    parser.add_argument("--model", default="", help="Model name (defaults per provider)")
+    parser.add_argument("--model", required=True, help="Exact model identifier")
+    parser.add_argument(
+        "--base-url",
+        default="",
+        help=(
+            "Optional OpenAI-compatible base URL, for example "
+            "https://lum.id/llm/v1. /chat/completions is appended when absent."
+        ),
+    )
+    parser.add_argument(
+        "--api-key-env",
+        default="",
+        help=(
+            "Environment variable containing the API key. Defaults to "
+            "OPENAI_API_KEY or ANTHROPIC_API_KEY according to --provider."
+        ),
+    )
+    parser.add_argument(
+        "--disable-thinking",
+        action="store_true",
+        help=(
+            "Send chat_template_kwargs.enable_thinking=false to compatible "
+            "OpenAI-style endpoints (recommended for Lumid Qwen models)."
+        ),
+    )
     parser.add_argument(
         "--shots",
-        "--shots-per-class",
-        dest="shots_per_class",
         type=int,
         default=0,
-        help="Number of few-shot examples per class (0 = zero-shot)",
+        choices=[0, 3],
+        help="Zero-shot or one train example per class",
     )
     parser.add_argument(
+        "--data-dir",
         "--local-dir",
-        default=None,
-        help="Path to local EventX data directory (skips HF download)",
+        dest="data_dir",
+        type=Path,
+        default=DEFAULT_DATA_DIR,
+        help="Frozen t1.kdd.v2 directory",
+    )
+    parser.add_argument("--split", choices=["train", "test"], default="train")
+    parser.add_argument(
+        "--allow-test",
+        action="store_true",
+        help="Required for any sealed-test access, including prompt preview",
     )
     parser.add_argument(
-        "--output",
-        "--output-file",
-        dest="output",
-        default=DEFAULT_OUTPUT,
-        help="JSONL file to append predictions to",
+        "--feature-rung",
+        choices=["market_only", "market_social"],
+        default="market_social",
     )
+    parser.add_argument("--output", default="t1_llm_predictions.jsonl")
+    parser.add_argument("--metrics-output", default=None)
     parser.add_argument("--limit", type=int, default=0, help="Max test samples to evaluate")
-    parser.add_argument("--start-index", type=int, default=0, help="Start offset into test split")
     parser.add_argument("--resume", action="store_true", help="Skip already-predicted IDs")
+    parser.add_argument("--overwrite", action="store_true")
     parser.add_argument("--dry-run", action="store_true", help="Print prompts without calling API")
-    parser.add_argument(
-        "--sleep",
-        "--sleep-seconds",
-        dest="sleep_seconds",
-        type=float,
-        default=0.0,
-        help="Seconds between processed requests",
-    )
-    parser.add_argument(
-        "--timeout",
-        "--timeout-seconds",
-        dest="timeout_seconds",
-        type=float,
-        default=120.0,
-        help="API request timeout",
-    )
-    parser.add_argument("--workers", type=int, default=1, help="Parallel workers for hosted APIs")
-    parser.add_argument("--api-key", default="", help="Optional explicit API key override")
-    parser.add_argument(
-        "--include-question",
-        dest="include_question",
-        action="store_true",
-        help="Include the market question in the prompt",
-    )
-    parser.add_argument(
-        "--no-include-question",
-        dest="include_question",
-        action="store_false",
-        help="Omit the market question from the prompt",
-    )
-    parser.add_argument(
-        "--include-structured-features",
-        dest="include_structured_features",
-        action="store_true",
-        help="Include numeric social-signal features in the prompt",
-    )
-    parser.add_argument(
-        "--no-include-structured-features",
-        dest="include_structured_features",
-        action="store_false",
-        help="Omit numeric social-signal features from the prompt",
-    )
-    parser.add_argument(
-        "--max-event-text-chars",
-        type=int,
-        default=1200,
-        help="Maximum characters of event_text to include",
-    )
-    parser.add_argument("--chunk-size", type=int, default=128, help="Batch size for local Qwen")
-    parser.add_argument("--tensor-parallel-size", type=int, default=1)
-    parser.add_argument("--dtype", default="auto")
-    parser.add_argument("--quantization", default="")
-    parser.add_argument("--gpu-memory-utilization", type=float, default=0.75)
-    parser.add_argument("--max-model-len", type=int, default=4096)
-    parser.add_argument("--max-num-seqs", type=int, default=8)
-    parser.add_argument("--max-tokens", type=int, default=220)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--hf-token", default=os.getenv("HF_TOKEN", ""))
-    parser.add_argument("--trust-remote-code", dest="trust_remote_code", action="store_true")
-    parser.add_argument("--no-trust-remote-code", dest="trust_remote_code", action="store_false")
-    parser.add_argument("--enforce-eager", action="store_true")
-    parser.add_argument("--enable-prefix-caching", action="store_true")
-    parser.set_defaults(
-        include_question=True,
-        include_structured_features=True,
-        trust_remote_code=True,
-    )
+    parser.add_argument("--sleep", type=float, default=0.0, help="Seconds between API calls")
+    parser.add_argument("--timeout", type=float, default=120.0, help="API request timeout")
     return parser.parse_args()
 
 
@@ -212,21 +160,43 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 
-def load_data(local_dir: Optional[str]) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Load train/test splits via eventxbench loader."""
-    import eventxbench
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
-    if local_dir:
-        train_df, test_df = eventxbench.load_task("t1", local_dir=local_dir)
-    else:
-        train_df, test_df = eventxbench.load_task("t1")
-    return train_df, test_df
+
+def load_data(
+    data_dir: Path,
+    split: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any], Path, Path]:
+    """Load train plus one requested split from the frozen v2 release."""
+    manifest_path = data_dir / "manifest.json"
+    train_path = data_dir / "train.jsonl"
+    eval_path = data_dir / f"{split}.jsonl"
+    for path in (manifest_path, train_path, eval_path):
+        if not path.is_file():
+            raise FileNotFoundError(f"Missing canonical T1 file: {path}")
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if manifest.get("dataset_version") != DATASET_VERSION:
+        raise ValueError(
+            f"Expected {DATASET_VERSION}, got {manifest.get('dataset_version')!r}"
+        )
+    train_df = pd.read_json(train_path, lines=True)
+    eval_df = pd.read_json(eval_path, lines=True)
+    expected = int(manifest["counts"]["by_split"][split])
+    if len(eval_df) != expected:
+        raise ValueError(
+            f"{split}: manifest declares {expected} rows, found {len(eval_df)}"
+        )
+    return train_df, eval_df, manifest, manifest_path, eval_path
 
 
 # ---------------------------------------------------------------------------
 # Prompt construction
 # ---------------------------------------------------------------------------
-
 
 def _fmt(value: Any) -> str:
     if value is None or (isinstance(value, float) and pd.isna(value)):
@@ -236,46 +206,34 @@ def _fmt(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value).strip())
 
 
-def _trim(text: Any, max_chars: int) -> str:
+def _trim(text: Any, max_chars: int = 1200) -> str:
     s = _fmt(text)
     if len(s) <= max_chars:
         return s
     return s[: max_chars - 3].rstrip() + "..."
 
 
-def _instance_block(
-    row: dict[str, Any],
-    feature_cols: list[str],
-    args: argparse.Namespace,
-) -> str:
-    lines: list[str] = []
-    if args.include_question:
-        lines.append(f"- question: {_fmt(row.get('question'))}")
-    lines.append(f"- event_group_label: {_fmt(row.get('event_group_label'))}")
-    lines.append(f"- event_text: {_trim(row.get('event_text'), args.max_event_text_chars)}")
-    if args.include_structured_features and feature_cols:
-        lines.append("- structured_features:")
-        for col in feature_cols:
-            if col in row:
-                lines.append(f"    {col}: {_fmt(row.get(col))}")
+def _instance_block(row: dict[str, Any], feature_cols: list[str]) -> str:
+    lines = []
+    for col in feature_cols:
+        value = _trim(row.get(col)) if col in {"question", "description"} else _fmt(
+            row.get(col)
+        )
+        lines.append(f"- {col}: {value}")
     return "\n".join(lines)
 
 
-def select_feature_columns(train_df: pd.DataFrame, test_df: pd.DataFrame) -> list[str]:
-    available_cols = set(train_df.columns).union(set(test_df.columns))
-    return [col for col in FEATURE_COLUMNS if col in available_cols]
-
-
-def select_few_shot_examples(
-    train_df: pd.DataFrame,
-    shots_per_class: int,
+def select_few_shot(
+    train_df: pd.DataFrame, shots: int
 ) -> list[dict[str, Any]]:
-    if shots_per_class <= 0:
+    if shots == 0:
         return []
     examples: list[dict[str, Any]] = []
     for label in LABEL_ORDER:
-        subset = train_df[train_df["interest_label"].astype(str) == label]
-        examples.extend(subset.head(shots_per_class).to_dict("records"))
+        sub = train_df[train_df["interest_label"].astype(str) == label]
+        if sub.empty:
+            raise ValueError(f"Train split has no few-shot example for {label}")
+        examples.append(sub.sort_values("condition_id").iloc[0].to_dict())
     return examples
 
 
@@ -283,85 +241,69 @@ def build_user_prompt(
     row: dict[str, Any],
     feature_cols: list[str],
     few_shot: list[dict[str, Any]],
-    args: argparse.Namespace,
 ) -> str:
     parts = ["Task 1: Pre-Market Interest Forecasting\n"]
+
     if few_shot:
         parts.append("Labeled examples:")
-        for index, example in enumerate(few_shot, 1):
-            block = _instance_block(example, feature_cols, args)
-            parts.append(f"Example {index}:\n{block}\n- label: {example['interest_label']}")
+        for i, ex in enumerate(few_shot, 1):
+            block = _instance_block(ex, feature_cols)
+            parts.append(f"Example {i}:\n{block}\n- label: {ex['interest_label']}")
         parts.append("")
+
     parts.append("Target market to classify:")
-    parts.append(_instance_block(row, feature_cols, args))
+    parts.append(_instance_block(row, feature_cols))
     parts.append("")
     parts.append("Return strict JSON only.")
     return "\n".join(parts)
 
 
-def build_chat_prompt(user_prompt: str) -> str:
-    return "\n".join(
-        [
-            "<|im_start|>system",
-            SYSTEM_PROMPT,
-            "<|im_end|>",
-            "<|im_start|>user",
-            user_prompt,
-            "<|im_end|>",
-            "<|im_start|>assistant",
-            "<think>\n</think>",
-        ]
-    )
-
-
 # ---------------------------------------------------------------------------
-# API callers
+# API callers  (stdlib only -- no SDK dependency)
 # ---------------------------------------------------------------------------
 
 
-def is_local_qwen_provider(provider: str) -> bool:
-    return provider in {"qwen", "qwen-local"}
-
-
-def default_model_for_provider(provider: str) -> str:
-    if provider == "anthropic":
-        return DEFAULT_ANTHROPIC_MODEL
-    if provider == "xai":
-        return DEFAULT_XAI_MODEL
-    if is_local_qwen_provider(provider):
-        return DEFAULT_QWEN_MODEL
-    return DEFAULT_OPENAI_MODEL
-
-
-def api_key_env_for_provider(provider: str) -> str:
-    if provider == "anthropic":
-        return "ANTHROPIC_API_KEY"
-    if provider == "xai":
-        return "XAI_API_KEY"
-    return "OPENAI_API_KEY"
-
-
-def api_key_for_provider(provider: str, explicit: str) -> str:
-    if explicit:
-        return explicit
-    if is_local_qwen_provider(provider):
-        return ""
-    return os.getenv(api_key_env_for_provider(provider), "")
-
-
-def _post_json(url: str, headers: dict[str, str], body: dict[str, Any], timeout: float) -> dict[str, Any]:
+def _post_json(url: str, headers: dict, body: dict, timeout: float) -> dict:
     data = json.dumps(body).encode("utf-8")
     req = urllib.request.Request(url, data=data, headers=headers, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        raw = resp.read()
+        if not raw:
+            raise RuntimeError(
+                f"Empty HTTP response (status={resp.status}, final_url={resp.url})"
+            )
+        try:
+            return json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            content_type = resp.headers.get("Content-Type", "unknown")
+            preview = raw[:200].decode("utf-8", errors="replace")
+            raise RuntimeError(
+                "Non-JSON HTTP response "
+                f"(status={resp.status}, final_url={resp.url}, "
+                f"content_type={content_type}, body_prefix={preview!r})"
+            ) from exc
+
+
+def openai_chat_url(base_url: str, provider: str = "openai") -> str:
+    """Resolve an OpenAI-compatible base URL without altering official default."""
+    if not base_url:
+        return XAI_API_URL if provider == "xai" else OPENAI_API_URL
+    normalized = base_url.rstrip("/")
+    if normalized.endswith("/chat/completions"):
+        return normalized
+    if normalized.endswith("/v1"):
+        return normalized + "/chat/completions"
+    return normalized + "/v1/chat/completions"
 
 
 def call_openai(
     api_key: str,
     model: str,
     user_prompt: str,
-    timeout_seconds: float,
-) -> tuple[dict[str, Any], str]:
+    timeout: float,
+    api_url: str = OPENAI_API_URL,
+    disable_thinking: bool = False,
+) -> str:
     body = {
         "model": model,
         "messages": [
@@ -371,24 +313,21 @@ def call_openai(
         "temperature": 0.0,
         "max_tokens": 300,
     }
+    if disable_thinking:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
     }
-    response_json = _post_json(OPENAI_API_URL, headers, body, timeout_seconds)
-    output_text = response_json["choices"][0]["message"]["content"].strip()
-    return response_json, output_text
+    resp = _post_json(api_url, headers, body, timeout)
+    return resp["choices"][0]["message"]["content"].strip()
 
 
-def call_anthropic(
-    api_key: str,
-    model: str,
-    user_prompt: str,
-    timeout_seconds: float,
-) -> tuple[dict[str, Any], str]:
+def call_anthropic(api_key: str, model: str, user_prompt: str, timeout: float) -> str:
     body = {
         "model": model,
         "max_tokens": 300,
+        "temperature": 0.0,
         "system": SYSTEM_PROMPT,
         "messages": [{"role": "user", "content": user_prompt}],
     }
@@ -397,73 +336,32 @@ def call_anthropic(
         "x-api-key": api_key,
         "anthropic-version": "2023-06-01",
     }
-    response_json = _post_json(ANTHROPIC_API_URL, headers, body, timeout_seconds)
-    parts = [
-        chunk["text"]
-        for chunk in response_json.get("content", [])
-        if chunk.get("type") == "text"
-    ]
-    return response_json, "\n".join(parts).strip()
+    resp = _post_json(ANTHROPIC_API_URL, headers, body, timeout)
+    parts = [c["text"] for c in resp.get("content", []) if c.get("type") == "text"]
+    return "\n".join(parts).strip()
 
 
-def extract_xai_output_text(response_json: dict[str, Any]) -> str:
-    output_text = response_json.get("output_text")
-    if isinstance(output_text, str) and output_text.strip():
-        return output_text.strip()
-
-    parts: list[str] = []
-    for item in response_json.get("output", []):
-        if item.get("type") != "message":
-            continue
-        for content_item in item.get("content", []):
-            item_type = content_item.get("type")
-            if item_type in {"output_text", "text"}:
-                text = content_item.get("text")
-                if isinstance(text, str) and text.strip():
-                    parts.append(text.strip())
-    if parts:
-        return "\n".join(parts).strip()
-
-    try:
-        return response_json["choices"][0]["message"]["content"].strip()
-    except Exception as exc:  # noqa: BLE001
-        raise ValueError(f"Unable to extract xAI response text: {exc}") from exc
-
-
-def call_xai(
-    api_key: str,
-    model: str,
-    user_prompt: str,
-    timeout_seconds: float,
-) -> tuple[dict[str, Any], str]:
-    body = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-    headers = {
-        "Content-Type": "application/json",
-        "Accept": "application/json",
-        "Authorization": f"Bearer {api_key}",
-    }
-    response_json = _post_json(XAI_API_URL, headers, body, timeout_seconds)
-    return response_json, extract_xai_output_text(response_json)
-
-
-def call_provider(
+def call_llm(
     provider: str,
     api_key: str,
     model: str,
-    user_prompt: str,
-    timeout_seconds: float,
-) -> tuple[dict[str, Any], str]:
+    prompt: str,
+    timeout: float,
+    base_url: str = "",
+    disable_thinking: bool = False,
+) -> str:
     if provider == "anthropic":
-        return call_anthropic(api_key, model, user_prompt, timeout_seconds)
-    if provider == "xai":
-        return call_xai(api_key, model, user_prompt, timeout_seconds)
-    return call_openai(api_key, model, user_prompt, timeout_seconds)
+        if base_url:
+            raise ValueError("--base-url currently supports the OpenAI-compatible provider only")
+        return call_anthropic(api_key, model, prompt, timeout)
+    return call_openai(
+        api_key,
+        model,
+        prompt,
+        timeout,
+        openai_chat_url(base_url, provider),
+        disable_thinking,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -471,99 +369,51 @@ def call_provider(
 # ---------------------------------------------------------------------------
 
 
-def _clean_prediction_text(text: str) -> str:
-    candidate = text.strip()
-    candidate = re.sub(r"^```(?:json)?\s*", "", candidate, flags=re.IGNORECASE)
-    candidate = re.sub(r"\s*```$", "", candidate)
-    return candidate.strip()
-
-
-def _extract_json_candidate(text: str) -> str:
-    candidate = _clean_prediction_text(text)
-    start = candidate.find("{")
-    if start >= 0:
-        candidate = candidate[start:]
-    open_braces = candidate.count("{")
-    close_braces = candidate.count("}")
-    if open_braces > close_braces:
-        candidate = candidate + ("}" * (open_braces - close_braces))
-    end = candidate.rfind("}")
-    if end >= 0:
-        candidate = candidate[: end + 1]
-    return candidate
-
-
-def _regex_fallback_prediction(text: str) -> dict[str, Any]:
-    candidate = _clean_prediction_text(text)
-    label_match = re.search(r'"label"\s*:\s*"([^"]+)"', candidate)
-    if not label_match:
-        raise ValueError("unable to recover label from model output")
-    label = label_match.group(1).strip()
-    if label not in VALID_LABELS:
-        raise ValueError(f"invalid label: {label!r}")
-    confidence_match = re.search(r'"confidence"\s*:\s*([0-9]+(?:\.[0-9]+)?)', candidate)
-    confidence = float(confidence_match.group(1)) if confidence_match else None
-    scores: dict[str, float] = {}
-    for target_label in LABEL_ORDER:
-        score_match = re.search(
-            rf'"{re.escape(target_label)}"\s*:\s*([0-9]+(?:\.[0-9]+)?)',
-            candidate,
-        )
-        scores[target_label] = float(score_match.group(1)) if score_match else 0.0
-    return {"label": label, "confidence": confidence, "scores": scores}
-
-
 def parse_prediction(text: str) -> dict[str, Any]:
-    candidate = _clean_prediction_text(text)
+    """Extract label, confidence, and per-class scores from LLM JSON output."""
+    candidate = text.strip()
     try:
         payload = json.loads(candidate)
     except json.JSONDecodeError:
-        try:
-            payload = json.loads(_extract_json_candidate(candidate))
-        except json.JSONDecodeError:
-            payload = _regex_fallback_prediction(candidate)
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start < 0 or end <= start:
+            raise
+        payload = json.loads(candidate[start : end + 1])
 
     label = payload.get("label")
     if label not in VALID_LABELS:
-        raise ValueError(f"invalid label: {label!r}")
+        raise ValueError(f"Invalid label: {label!r}")
 
     scores = payload.get("scores") or {}
-    parsed_scores = {
-        target_label: max(0.0, float(scores.get(target_label, 0.0)))
-        for target_label in LABEL_ORDER
-    }
-    score_sum = sum(parsed_scores.values())
-    if score_sum > 0:
-        parsed_scores = {
-            key: value / score_sum for key, value in parsed_scores.items()
-        }
+    parsed = {k: max(0.0, float(scores.get(k, 0.0))) for k in LABEL_ORDER}
+    total = sum(parsed.values())
+    if total > 0:
+        parsed = {k: v / total for k, v in parsed.items()}
     else:
-        parsed_scores = {
-            key: (1.0 if key == label else 0.0) for key in LABEL_ORDER
-        }
+        parsed = {k: (1.0 if k == label else 0.0) for k in LABEL_ORDER}
 
-    confidence = payload.get("confidence")
-    if confidence is None:
-        confidence = parsed_scores[label]
-
+    confidence = float(payload.get("confidence", parsed[label]))
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError(f"Confidence outside [0,1]: {confidence}")
     return {
         "label": label,
-        "confidence": float(confidence),
-        "scores": parsed_scores,
+        "confidence": confidence,
+        "scores": parsed,
     }
 
 
 # ---------------------------------------------------------------------------
-# JSONL helpers
+# I/O helpers
 # ---------------------------------------------------------------------------
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
-    rows: list[dict[str, Any]] = []
+    rows = []
     if not path.exists():
         return rows
-    with path.open("r", encoding="utf-8") as handle:
-        for line in handle:
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
             line = line.strip()
             if line:
                 rows.append(json.loads(line))
@@ -572,8 +422,22 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 def append_jsonl(path: Path, row: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def compact_jsonl(
+    path: Path,
+    source_rows: list[dict[str, Any]],
+    latest: dict[str, dict[str, Any]],
+) -> None:
+    with path.open("w", encoding="utf-8") as handle:
+        for source in source_rows:
+            condition_id = str(source["condition_id"])
+            if condition_id in latest:
+                handle.write(
+                    json.dumps(latest[condition_id], ensure_ascii=False) + "\n"
+                )
 
 
 # ---------------------------------------------------------------------------
@@ -581,90 +445,30 @@ def append_jsonl(path: Path, row: dict[str, Any]) -> None:
 # ---------------------------------------------------------------------------
 
 
-def evaluate(gold: list[str], pred: list[str]) -> dict[str, float]:
-    from sklearn.metrics import accuracy_score, f1_score
-
-    return {
+def evaluate(
+    gold: list[str],
+    pred: list[str],
+    scores: list[dict[str, float]] | None = None,
+) -> dict[str, float | None]:
+    metrics: dict[str, float | None] = {
         "accuracy": accuracy_score(gold, pred),
-        "macro_f1": f1_score(
-            gold,
-            pred,
-            labels=LABEL_ORDER,
-            average="macro",
-            zero_division=0,
-        ),
+        "macro_f1": f1_score(gold, pred, labels=LABEL_ORDER, average="macro", zero_division=0),
     }
-
-
-def build_result_row(
-    row: dict[str, Any],
-    args: argparse.Namespace,
-    api_key: str,
-    feature_cols: list[str],
-    few_shot_examples: list[dict[str, Any]],
-) -> dict[str, Any]:
-    user_prompt = build_user_prompt(row, feature_cols, few_shot_examples, args)
-    result_row: dict[str, Any] = {
-        "condition_id": str(row["condition_id"]),
-        "provider": args.provider,
-        "model": args.model,
-        "gold_label": row.get("interest_label"),
-    }
-
-    if args.dry_run:
-        result_row["user_prompt"] = user_prompt
-        return result_row
-
-    if is_local_qwen_provider(args.provider):
-        result_row["prompt"] = build_chat_prompt(user_prompt)
-        result_row["user_prompt"] = user_prompt
-        return result_row
-
-    try:
-        response_json, output_text = call_provider(
-            args.provider,
-            api_key,
-            args.model,
-            user_prompt,
-            args.timeout_seconds,
+    if scores:
+        ranked = sorted(
+            zip(gold, scores),
+            key=lambda item: item[1].get("high_interest", 0.0),
+            reverse=True,
         )
-        parsed = parse_prediction(output_text)
-        result_row["prediction"] = parsed
-        result_row["raw_output"] = output_text
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        result_row["error"] = {"type": "http_error", "status": exc.code, "body": body}
-    except Exception as exc:  # noqa: BLE001
-        result_row["error"] = {"type": exc.__class__.__name__, "message": str(exc)}
-    return result_row
-
-
-def chunked(rows: list[dict[str, Any]], size: int) -> list[list[dict[str, Any]]]:
-    return [rows[index:index + size] for index in range(0, len(rows), size)]
-
-
-def run_qwen_generation(
-    llm: Any,
-    sampling_params: Any,
-    batch_rows: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    prompts = [row["prompt"] for row in batch_rows]
-    outputs = llm.generate(prompts, sampling_params)
-    result_rows: list[dict[str, Any]] = []
-    for base_row, output in zip(batch_rows, outputs):
-        result_row = {key: value for key, value in base_row.items() if key != "prompt"}
-        try:
-            output_text = output.outputs[0].text.strip() if output.outputs else ""
-            if not output_text:
-                raise ValueError("empty model output")
-            parsed = parse_prediction(output_text)
-            result_row["prediction"] = parsed
-            result_row["raw_output"] = output_text
-        except Exception as exc:  # noqa: BLE001
-            result_row["raw_output"] = output.outputs[0].text if output.outputs else ""
-            result_row["error"] = {"type": exc.__class__.__name__, "message": str(exc)}
-        result_rows.append(result_row)
-    return result_rows
+        for k in (5, 10):
+            use_k = min(k, len(ranked))
+            metrics[f"high_interest_precision_at_{k}"] = (
+                sum(label == "high_interest" for label, _ in ranked[:use_k])
+                / use_k
+                if use_k
+                else None
+            )
+    return metrics
 
 
 # ---------------------------------------------------------------------------
@@ -674,164 +478,213 @@ def run_qwen_generation(
 
 def main() -> None:
     args = parse_args()
-    args.model = args.model or default_model_for_provider(args.provider)
-    api_key = api_key_for_provider(args.provider, args.api_key)
+    if args.split == "test" and not args.allow_test:
+        raise SystemExit("Refusing sealed test run without --allow-test")
+    if args.resume and args.overwrite:
+        raise SystemExit("Choose only one of --resume and --overwrite")
 
-    if not args.dry_run and not is_local_qwen_provider(args.provider) and not api_key:
-        env_name = api_key_env_for_provider(args.provider)
-        print(f"ERROR: Set {env_name} environment variable or pass --api-key.", file=sys.stderr)
-        sys.exit(1)
-
-    print(
-        f"Provider: {args.provider}  Model: {args.model}  "
-        f"Shots/class: {args.shots_per_class}"
+    train_df, eval_df, manifest, manifest_path, eval_path = load_data(
+        args.data_dir,
+        args.split,
     )
-    train_df, test_df = load_data(args.local_dir)
+    feature_cols = list(manifest["feature_rungs"][args.feature_rung])
+    forbidden = set(manifest["forbidden_feature_columns"])
+    leaked = forbidden & set(feature_cols)
+    if leaked:
+        raise ValueError(f"Manifest feature rung contains forbidden fields: {leaked}")
+    missing = set(feature_cols) - set(eval_df.columns)
+    if missing:
+        raise ValueError(f"Evaluation split is missing features: {sorted(missing)}")
+    for split_name, frame in (("train", train_df), (args.split, eval_df)):
+        invalid = set(frame["interest_label"].astype(str)) - VALID_LABELS
+        if invalid:
+            raise ValueError(f"{split_name}: unknown labels {sorted(invalid)}")
 
-    if args.start_index > 0:
-        test_df = test_df.iloc[args.start_index:].reset_index(drop=True)
+    few_shot = select_few_shot(train_df, args.shots)
+    config = {
+        "version": "t1.llm.baseline.run.v2",
+        "dataset_version": DATASET_VERSION,
+        "prompt_version": PROMPT_VERSION,
+        "provider": args.provider,
+        "model": args.model,
+        "split": args.split,
+        "shots": args.shots,
+        "feature_rung": args.feature_rung,
+        "input_fields": feature_cols,
+        "few_shot_condition_ids": [
+            str(row["condition_id"]) for row in few_shot
+        ],
+        "temperature": 0,
+        "thinking_enabled": not args.disable_thinking,
+        "system_prompt_sha256": hashlib.sha256(
+            SYSTEM_PROMPT.encode("utf-8")
+        ).hexdigest(),
+        "runner_sha256": _sha256(Path(__file__).resolve()),
+    }
+    run_id = hashlib.sha256(
+        json.dumps(config, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+    api_url = (
+        ANTHROPIC_API_URL
+        if args.provider == "anthropic" and not args.base_url
+        else openai_chat_url(args.base_url, args.provider)
+    )
+    print(
+        f"T1 v2: split={args.split} rows={len(eval_df)} provider={args.provider} "
+        f"model={args.model} shots={args.shots} rung={args.feature_rung}"
+    )
+    print(f"Endpoint: {api_url}  Run ID: {run_id}")
+
+    records = eval_df.to_dict("records")
     if args.limit > 0:
-        test_df = test_df.head(args.limit).reset_index(drop=True)
+        records = records[: args.limit]
+    if not records:
+        raise SystemExit("No rows selected")
+    if args.dry_run:
+        print("\n=== SYSTEM PROMPT ===")
+        print(SYSTEM_PROMPT)
+        print("\n=== PROMPT PREVIEW ===")
+        print(build_user_prompt(records[0], feature_cols, few_shot))
+        return
 
-    feature_cols = select_feature_columns(train_df, test_df)
-    few_shot_examples = select_few_shot_examples(train_df, args.shots_per_class)
+    env_var = args.api_key_env or {
+        "openai": "OPENAI_API_KEY",
+        "anthropic": "ANTHROPIC_API_KEY",
+        "xai": "XAI_API_KEY",
+    }[args.provider]
+    api_key = os.environ.get(env_var, "")
+    if not api_key:
+        raise SystemExit(f"Set {env_var} environment variable")
 
     output_path = Path(args.output)
-    completed_ids: set[str] = set()
-    if args.resume and output_path.exists():
-        for row in read_jsonl(output_path):
-            completed_ids.add(str(row.get("condition_id", "")))
-        print(f"Resuming: {len(completed_ids)} predictions already cached.")
+    if output_path.exists() and not (args.resume or args.overwrite):
+        raise SystemExit(
+            f"Output exists: {output_path}; use --resume or --overwrite"
+        )
+    if args.overwrite and output_path.exists():
+        output_path.unlink()
+    cached = read_jsonl(output_path) if args.resume else []
+    latest = {str(row["condition_id"]): row for row in cached}
+    for row in latest.values():
+        if row.get("run_id") != run_id:
+            raise SystemExit("Existing output has a different run configuration")
+    completed_ids = {
+        cid for cid, row in latest.items() if not row.get("error")
+    }
+    print(f"Cached successes: {len(completed_ids)}")
 
-    records = [
-        row
-        for row in test_df.to_dict("records")
-        if str(row["condition_id"]) not in completed_ids
-    ]
-
-    processed = 0
     errors = 0
-    gold_labels: list[str] = []
-    pred_labels: list[str] = []
+    for i, row in enumerate(records):
+        cid = str(row["condition_id"])
+        if cid in completed_ids:
+            continue
 
-    if is_local_qwen_provider(args.provider):
-        prompt_rows = [
-            build_result_row(row, args, api_key, feature_cols, few_shot_examples)
-            for row in records
-        ]
-        if args.dry_run:
-            for index, result_row in enumerate(prompt_rows, 1):
-                append_jsonl(output_path, result_row)
-                processed += 1
-                print(f"[{index}/{len(prompt_rows)}] {result_row['condition_id']} (dry-run)")
-        elif prompt_rows:
-            try:
-                from vllm import LLM, SamplingParams
-            except ImportError as exc:
-                raise SystemExit("Install vllm to use --provider qwen or qwen-local") from exc
+        prompt = build_user_prompt(row, feature_cols, few_shot)
+        result: dict[str, Any] = {
+            "condition_id": cid,
+            "split": args.split,
+            "provider": args.provider,
+            "model": args.model,
+            "shots": args.shots,
+            "feature_rung": args.feature_rung,
+            "run_id": run_id,
+        }
 
-            llm = LLM(
-                model=args.model,
-                tensor_parallel_size=args.tensor_parallel_size,
-                dtype=args.dtype,
-                quantization=args.quantization or None,
-                trust_remote_code=args.trust_remote_code,
-                gpu_memory_utilization=args.gpu_memory_utilization,
-                max_model_len=args.max_model_len,
-                max_num_seqs=args.max_num_seqs,
-                enforce_eager=args.enforce_eager,
-                enable_prefix_caching=args.enable_prefix_caching,
-                hf_token=args.hf_token or None,
-            )
-            sampling_params = SamplingParams(
-                temperature=args.temperature,
-                max_tokens=args.max_tokens,
-                stop=["<|im_end|>"],
-            )
-            for batch_rows in chunked(prompt_rows, max(1, args.chunk_size)):
-                for result_row in run_qwen_generation(llm, sampling_params, batch_rows):
-                    append_jsonl(output_path, result_row)
-                    processed += 1
-                    if "error" in result_row:
-                        errors += 1
-                    else:
-                        prediction = result_row.get("prediction") or {}
-                        label = prediction.get("label")
-                        gold_label = str(result_row.get("gold_label", ""))
-                        if label in VALID_LABELS and gold_label in VALID_LABELS:
-                            gold_labels.append(gold_label)
-                            pred_labels.append(label)
-                    print(f"  [{processed}/{len(prompt_rows)}] errors={errors}", flush=True)
-                    if args.sleep_seconds > 0:
-                        time.sleep(args.sleep_seconds)
-    elif args.workers <= 1:
-        total = len(records)
-        for index, row in enumerate(records, 1):
-            result_row = build_result_row(
-                row,
-                args,
+        try:
+            raw = call_llm(
+                args.provider,
                 api_key,
-                feature_cols,
-                few_shot_examples,
+                args.model,
+                prompt,
+                args.timeout,
+                args.base_url,
+                args.disable_thinking,
             )
-            append_jsonl(output_path, result_row)
-            processed += 1
-            if "error" in result_row:
-                errors += 1
-            else:
-                prediction = result_row.get("prediction") or {}
-                label = prediction.get("label")
-                gold_label = str(result_row.get("gold_label", ""))
-                if label in VALID_LABELS and gold_label in VALID_LABELS:
-                    gold_labels.append(gold_label)
-                    pred_labels.append(label)
-            if args.dry_run:
-                print(f"[{index}/{total}] {result_row['condition_id']} (dry-run)")
-            elif index % 20 == 0 or index == total:
-                print(f"  [{index}/{total}] errors={errors}")
-            if args.sleep_seconds > 0:
-                time.sleep(args.sleep_seconds)
-    else:
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.workers) as executor:
-            futures = [
-                executor.submit(
-                    build_result_row,
-                    row,
-                    args,
-                    api_key,
-                    feature_cols,
-                    few_shot_examples,
-                )
-                for row in records
-            ]
-            for index, future in enumerate(concurrent.futures.as_completed(futures), 1):
-                result_row = future.result()
-                append_jsonl(output_path, result_row)
-                processed += 1
-                if "error" in result_row:
-                    errors += 1
-                else:
-                    prediction = result_row.get("prediction") or {}
-                    label = prediction.get("label")
-                    gold_label = str(result_row.get("gold_label", ""))
-                    if label in VALID_LABELS and gold_label in VALID_LABELS:
-                        gold_labels.append(gold_label)
-                        pred_labels.append(label)
-                if args.dry_run:
-                    print(f"[{index}/{len(futures)}] {result_row['condition_id']} (dry-run)")
-                elif index % 20 == 0 or index == len(futures):
-                    print(f"  [{index}/{len(futures)}] errors={errors}")
-                if args.sleep_seconds > 0:
-                    time.sleep(args.sleep_seconds)
+            parsed = parse_prediction(raw)
+            result["prediction"] = parsed
+            result["raw_output"] = raw
+        except Exception as exc:
+            result["error"] = {"type": exc.__class__.__name__, "message": str(exc)}
+            errors += 1
 
-    print(f"\nPredictions written to {output_path}")
-    print(f"Total processed this run: {processed}  Errors: {errors}")
+        append_jsonl(output_path, result)
+        latest[cid] = result
 
-    if gold_labels and not args.dry_run:
-        metrics = evaluate(gold_labels, pred_labels)
-        print("\n--- Results ---")
-        print(f"Accuracy:  {metrics['accuracy']:.4f}")
-        print(f"Macro-F1:  {metrics['macro_f1']:.4f}")
+        if (i + 1) % 20 == 0 or i + 1 == len(records):
+            print(f"  [{i+1}/{len(records)}] errors={errors}")
+
+        if args.sleep > 0:
+            time.sleep(args.sleep)
+
+    wanted = {str(row["condition_id"]): row for row in records}
+    compact_jsonl(output_path, records, latest)
+    successful = {
+        cid: row
+        for cid, row in latest.items()
+        if cid in wanted and not row.get("error")
+    }
+    ordered_ids = [str(row["condition_id"]) for row in records]
+    missing_ids = [cid for cid in ordered_ids if cid not in successful]
+    gold_labels = [
+        str(wanted[cid]["interest_label"])
+        for cid in ordered_ids
+        if cid in successful
+    ]
+    pred_labels = [
+        str(successful[cid]["prediction"]["label"])
+        for cid in ordered_ids
+        if cid in successful
+    ]
+    pred_scores = [
+        successful[cid]["prediction"]["scores"]
+        for cid in ordered_ids
+        if cid in successful
+    ]
+    metrics = (
+        evaluate(gold_labels, pred_labels, pred_scores)
+        if gold_labels
+        else {}
+    )
+    report = {
+        **config,
+        "run_id": run_id,
+        "status": "complete" if not missing_ids else "incomplete",
+        "requested_rows": len(records),
+        "successful_rows": len(successful),
+        "failed_or_missing_rows": len(missing_ids),
+        "failed_or_missing_condition_ids": missing_ids,
+        "inputs": {
+            "manifest": {
+                "path": str(manifest_path),
+                "sha256": _sha256(manifest_path),
+            },
+            "evaluation_split": {
+                "path": str(eval_path),
+                "sha256": _sha256(eval_path),
+            },
+        },
+        "metrics": metrics,
+    }
+    metrics_path = (
+        Path(args.metrics_output)
+        if args.metrics_output
+        else output_path.with_suffix(".report.json")
+    )
+    metrics_path.parent.mkdir(parents=True, exist_ok=True)
+    metrics_path.write_text(
+        json.dumps(report, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    print(f"\nPredictions: {output_path}")
+    print(f"Report: {metrics_path}")
+    if metrics:
+        print(
+            f"Accuracy={metrics['accuracy']:.4f} "
+            f"Macro-F1={metrics['macro_f1']:.4f} N={len(gold_labels)}"
+        )
+    if missing_ids:
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

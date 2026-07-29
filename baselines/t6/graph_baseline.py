@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""T6 graph heuristic baseline.
+"""Legacy T6 v1 graph heuristic baseline.
 
 This is the paper graph baseline ported into EventXBench.  It uses the unified
 T6 label/feature JSONL for labels, split, confound filtering, and lag targets;
 the graph inputs remain external files because they are derived artifacts.
+
+It evaluates pre-v2 intraday propagation semantics and must not be reported as
+a ``t6.kdd.v2`` result. See ``baselines/t6/README.md``.
 """
 from __future__ import annotations
 

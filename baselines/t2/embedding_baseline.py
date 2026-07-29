@@ -5,6 +5,10 @@ Encodes tweet texts and market questions with BGE-large-en-v1.5, builds a
 FAISS cosine-similarity index over market embeddings, and retrieves the
 top-K markets for each tweet.  Reports Accuracy@1 and MRR.
 
+This is a legacy standalone recall probe, not the frozen contextual-r3
+leaderboard runner. Use ``python -m baselines.t2.contextual_baselines`` for
+the current deterministic T2 protocol.
+
 Note: This baseline requires tweet text.  For the public release (where text
 is stripped for privacy), you must first rehydrate tweets via the Twitter API.
 

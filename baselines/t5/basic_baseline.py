@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
-"""T5/T7 Basic Baselines -- Impact Persistence (Decay Classification).
+"""T5 daily KDD basic baselines -- Drift Persistence Classification.
 
-Evaluates majority-class and random-prior baselines for decay_class,
-aligned with the Task7-style dummy baseline report format.
+Evaluates majority-class and random-prior baselines for T5 decay
+classification.  Reports Macro-F1.
 
 Note: In the original codebase this task is referred to as T7 / task5+7,
 but in the paper and public release it is T5.
@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 
+import numpy as np
 import pandas as pd
 
 import eventxbench
@@ -42,30 +43,45 @@ def _macro_f1(y_true: list[str], y_pred: list[str], labels: list[str]) -> float:
 # ---------------------------------------------------------------------------
 # Baselines
 # ---------------------------------------------------------------------------
-def compute_majority_macro_f1(label_counts: dict[str, int]) -> tuple[float, str | None]:
-    total = sum(label_counts.values())
-    if total == 0 or not label_counts:
-        return 0.0, None
+def _majority_baseline(y_train: list[str], y_test: list[str]) -> dict:
+    counts = Counter(y_train)
+    majority = counts.most_common(1)[0][0]
+    y_pred = [majority] * len(y_test)
+    mf1 = _macro_f1(y_test, y_pred, DECAY_LABELS)
 
-    majority_label, majority_count = sorted(
-        label_counts.items(), key=lambda x: x[1], reverse=True
-    )[0]
-    p_majority = majority_count / total
-    num_classes = len(label_counts)
-
-    # Majority predicts one class for all samples.
-    macro_f1 = (2.0 * p_majority / (1.0 + p_majority)) / num_classes
-    return macro_f1 * 100.0, majority_label
+    return {
+        "baseline": "majority",
+        "majority_label": majority,
+        "n_train": len(y_train),
+        "n_test": len(y_test),
+        "macro_f1": mf1,
+    }
 
 
-def compute_random_prior_macro_f1(label_counts: dict[str, int]) -> float:
-    total = sum(label_counts.values())
-    if total == 0 or not label_counts:
-        return 0.0
+def _random_baseline(
+    y_train: list[str], y_test: list[str], seeds: list[int] | None = None
+) -> dict:
+    if seeds is None:
+        seeds = [13, 42, 123]
 
-    # Under random-prior prediction, expected F1 for class c equals p(c).
-    priors = [cnt / total for cnt in label_counts.values()]
-    return (sum(priors) / len(priors)) * 100.0
+    counts = Counter(y_train)
+    total = len(y_train)
+    priors = np.array([counts.get(lab, 0) / total for lab in DECAY_LABELS])
+
+    f1_scores = []
+    for seed in seeds:
+        rng = np.random.default_rng(seed)
+        y_pred = rng.choice(DECAY_LABELS, size=len(y_test), p=priors).tolist()
+        f1_scores.append(_macro_f1(y_test, y_pred, DECAY_LABELS))
+
+    return {
+        "baseline": "random_prior",
+        "seeds": seeds,
+        "n_train": len(y_train),
+        "n_test": len(y_test),
+        "mean_macro_f1": float(np.mean(f1_scores)),
+        "per_seed_macro_f1": [round(f, 4) for f in f1_scores],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -77,42 +93,28 @@ def main() -> None:
     args = parser.parse_args()
 
     data = eventxbench.load_task("t5", local_dir=args.local_dir)
-    if isinstance(data, tuple):
-        df = pd.concat(data, ignore_index=True)
-    else:
-        df = data
+    if not isinstance(data, tuple):
+        raise ValueError("Canonical T5 baseline requires frozen train/test splits.")
+    train_df, test_df = data
+    train_df = train_df[train_df["decay_class"].isin(DECAY_LABELS)]
+    test_df = test_df[test_df["decay_class"].isin(DECAY_LABELS)]
+    y_train = train_df["decay_class"].tolist()
+    y_test = test_df["decay_class"].tolist()
 
-    df = df[df["decay_class"].isin(DECAY_LABELS)].reset_index(drop=True)
+    print(f"T5 train/test samples: {len(y_train)}/{len(y_test)}")
+    print(f"Train class distribution: {dict(Counter(y_train))}")
+    print(f"Test class distribution: {dict(Counter(y_test))}")
 
-    tier_frames: list[tuple[str, object]] = [("1. All Data", df)]
-    if "confound_flag" in df.columns:
-        tier_frames.append(("2. Non-confounded", df[df["confound_flag"] == False].reset_index(drop=True)))
+    # Majority baseline
+    maj = _majority_baseline(y_train, y_test)
+    print(f"\n[Majority] always predict '{maj['majority_label']}'")
+    print(f"  Test Macro-F1: {maj['macro_f1']:.4f}")
 
-    print("\n" + "=" * 84)
-    print("TASK 7 DUMMY BASELINES REPORT (TARGET: decay_class)")
-    print("=" * 84)
-
-    for tier_name, tier_df in tier_frames:
-        labels = tier_df["decay_class"].dropna().astype(str).tolist()
-        label_counts = dict(Counter(labels))
-        total_samples = sum(label_counts.values())
-
-        print(f"\n--- Tier: {tier_name} ---")
-        if total_samples == 0:
-            print("No data.")
-            continue
-
-        majority_macro_f1, majority_label = compute_majority_macro_f1(label_counts)
-        random_macro_f1 = compute_random_prior_macro_f1(label_counts)
-
-        print(f"Total Samples: {total_samples}")
-        dist_items = []
-        for label, cnt in sorted(label_counts.items(), key=lambda x: x[1], reverse=True):
-            pct = cnt / total_samples * 100.0
-            dist_items.append(f"{label}({cnt}/{total_samples}={pct:.1f}%)")
-        print("Class Distribution: " + ", ".join(dist_items))
-        print(f"[*] Majority Baseline Macro-F1 (always predict '{majority_label}'): {majority_macro_f1:.2f}%")
-        print(f"[*] Random Prior Baseline Expected Macro-F1:               {random_macro_f1:.2f}%")
+    # Random baseline
+    rand = _random_baseline(y_train, y_test)
+    print(f"\n[Random Prior] sample from training distribution")
+    print(f"  Mean Macro-F1: {rand['mean_macro_f1']:.4f}")
+    print(f"  Per-seed: {rand['per_seed_macro_f1']}")
 
 
 if __name__ == "__main__":

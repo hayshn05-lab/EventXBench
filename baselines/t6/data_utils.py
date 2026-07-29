@@ -1,3 +1,9 @@
+"""Utilities for the legacy T6 v1 intraday propagation baselines.
+
+This module uses the pre-v2 label contract and is intentionally excluded from
+the canonical ``t6.kdd.v2`` path. See ``baselines/t6/README.md``.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path

@@ -24,7 +24,7 @@ import datasets
 
 _DESCRIPTION = (
     "EventX: A multimodal benchmark linking Twitter/X posts to "
-    "Polymarket prediction market dynamics across seven tasks."
+    "Polymarket prediction market dynamics across six canonical tasks."
 )
 
 _HOMEPAGE = "https://github.com/mlsys-io/EventXBench"
@@ -33,11 +33,15 @@ _LICENSE = "cc-by-nc-4.0"
 _URLS = {
     "t1_train": "data/t1/train.jsonl",
     "t1_test": "data/t1/test.jsonl",
-    "t2_test": "data/t2/test.jsonl",
+    "t2_train": "data/t2/t2_train.jsonl",
+    "t2_validation": "data/t2/t2_val.jsonl",
+    "t2_test": "data/t2/t2_test.jsonl",
     "t3_test": "data/t3/test.jsonl",
     "t4_train": "data/t4/train.jsonl",
+    "t4_validation": "data/t4/validation.jsonl",
     "t4_test": "data/t4/test.jsonl",
     "t5_train": "data/t5/train.jsonl",
+    "t5_validation": "data/t5/validation.jsonl",
     "t5_test": "data/t5/test.jsonl",
     "t6_train": "data/t6/train.jsonl",
     "t6_validation": "data/t6/validation.jsonl",
@@ -78,22 +82,22 @@ class EventXBench(datasets.GeneratorBasedBuilder):
         EventXBenchConfig(
             name="t4",
             version=VERSION,
-            description="T4: Market Movement Prediction (direction x magnitude)",
+            description="T4: Daily Market Movement Prediction (1/3/7-day horizons)",
         ),
         EventXBenchConfig(
             name="t5",
             version=VERSION,
-            description="T5: Volume & Price Impact (decay classification)",
+            description="T5: Forward Drift, Volume, and Persistence Prediction",
         ),
         EventXBenchConfig(
             name="t6",
             version=VERSION,
-            description="T6: Cross-Market Propagation (3-class)",
+            description="T6: Daily Cross-Market Co-Movement Forecasting (3-class)",
         ),
         EventXBenchConfig(
             name="t7",
             version=VERSION,
-            description="T7: Impact Persistence / Decay classification (3-class)",
+            description="Legacy T7 decay-only compatibility alias",
         ),
     ]
 

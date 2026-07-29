@@ -29,7 +29,7 @@ def load_task(
     """Load a task dataset.
 
     Args:
-        task: Task name (t1-t6).
+        task: Task name (t1-t7).
         repo: Hugging Face dataset repo ID.
         local_dir: If set, load from local directory instead of HF.
         split: If set, return only this split ("train", "validation"/"val", or "test").
@@ -78,11 +78,31 @@ def _load_jsonl(path: Path) -> pd.DataFrame:
 
 # Prepared HF layout: data/t1/train.jsonl, data/t1/test.jsonl
 _HF_LAYOUT = {
-    "t1": {"train": "t1/train.jsonl", "test": "t1/test.jsonl"},
-    "t2": {"test": "t2/test.jsonl"},
+    "t1": {
+        "train": "t1/train.jsonl",
+        "val": "t1/val.jsonl",
+        "validation": "t1/validation.jsonl",
+        "test": "t1/test.jsonl",
+    },
+    "t2": {
+        "train": "t2/t2_train.jsonl",
+        "val": "t2/t2_val.jsonl",
+        "validation": "t2/t2_val.jsonl",
+        "test": "t2/t2_test.jsonl",
+    },
     "t3": {"test": "t3/test.jsonl"},
-    "t4": {"train": "t4/train.jsonl", "test": "t4/test.jsonl"},
-    "t5": {"train": "t5/train.jsonl", "test": "t5/test.jsonl"},
+    "t4": {
+        "train": "t4/train.jsonl",
+        "val": "t4/validation.jsonl",
+        "validation": "t4/validation.jsonl",
+        "test": "t4/test.jsonl",
+    },
+    "t5": {
+        "train": "t5/train.jsonl",
+        "val": "t5/validation.jsonl",
+        "validation": "t5/validation.jsonl",
+        "test": "t5/test.jsonl",
+    },
     "t6": {
         "full": "t6/t6_full_with_split.jsonl",
         "train": "t6/train.jsonl",
@@ -118,7 +138,35 @@ def _detect_layout(data_dir: Path, task: str) -> str:
     """Auto-detect which directory layout is present."""
     if any((data_dir / rel_path).exists() for rel_path in _HF_LAYOUT[task].values()):
         return "hf"
+    # The versioned KDD builders expose their own directory as ``--local-dir``
+    # (for example ``KDD/data/t1_kdd_v1`` or ``t2_kdd_v1``), so split files
+    # are immediately inside data_dir rather than under a second task directory.
+    if task in ("t1", "t2", "t4", "t5", "t6") and any(
+        (data_dir / Path(rel_path).name).exists()
+        for rel_path in _HF_LAYOUT[task].values()
+    ):
+        return "hf"
     return "raw"
+
+
+def _is_direct_layout(data_dir: Path, task: str) -> bool:
+    if task not in ("t1", "t2", "t4", "t5", "t6"):
+        return False
+    nested_exists = any(
+        (data_dir / rel_path).exists() for rel_path in _HF_LAYOUT[task].values()
+    )
+    direct_exists = any(
+        (data_dir / Path(rel_path).name).exists()
+        for rel_path in _HF_LAYOUT[task].values()
+    )
+    return direct_exists and not nested_exists
+
+
+def _resolve_prepared_path(data_dir: Path, task: str, relative_path: str) -> Path:
+    """Resolve nested prepared paths plus the direct versioned task directory."""
+    if _is_direct_layout(data_dir, task):
+        return data_dir / Path(relative_path).name
+    return data_dir / relative_path
 
 
 def _resolve_layout_path(data_dir: Path, relative_path):
@@ -157,8 +205,10 @@ def _load_hf_layout(task: str, data_dir: Path, split: Optional[str]):
     """Load from prepared HF directory structure."""
     files = _HF_LAYOUT[task]
 
-    if "full" in files and (data_dir / files["full"]).exists():
-        df = _load_jsonl(data_dir / files["full"])
+    if "full" in files and _resolve_prepared_path(
+        data_dir, task, files["full"]
+    ).exists():
+        df = _load_jsonl(_resolve_prepared_path(data_dir, task, files["full"]))
         if split:
             split_value = "val" if split == "validation" else split
             return df[df["split"] == split_value].reset_index(drop=True)
@@ -168,16 +218,29 @@ def _load_hf_layout(task: str, data_dir: Path, split: Optional[str]):
         )
 
     if split:
-        split_key = _normalize_split_name(split, files.keys())
-        if split_key not in files:
-            available = sorted(files.keys())
+        # Some prepared datasets call the development split ``val`` and some
+        # call it ``validation``.  Resolve aliases against files that actually
+        # exist, rather than merely against the declared layout: both names are
+        # declared above so that either on-disk convention is supported.
+        available_files = {
+            key: _resolve_prepared_path(data_dir, task, relative_path)
+            for key, relative_path in files.items()
+            if key != "full"
+            and _resolve_prepared_path(data_dir, task, relative_path).exists()
+        }
+        split_key = _normalize_split_name(split, available_files.keys())
+        if split_key not in available_files:
+            available = sorted(available_files.keys())
             raise ValueError(f"Task {task} has no '{split}' split. Available: {available}")
-        return _load_jsonl(data_dir / files[split_key])
+        return _load_jsonl(available_files[split_key])
 
     if "train" in files and "test" in files:
-        return _load_jsonl(data_dir / files["train"]), _load_jsonl(data_dir / files["test"])
+        return (
+            _load_jsonl(_resolve_prepared_path(data_dir, task, files["train"])),
+            _load_jsonl(_resolve_prepared_path(data_dir, task, files["test"])),
+        )
 
-    return _load_jsonl(data_dir / files["test"])
+    return _load_jsonl(_resolve_prepared_path(data_dir, task, files["test"]))
 
 
 def _load_raw_layout(task: str, data_dir: Path, split: Optional[str]):
