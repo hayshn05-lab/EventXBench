@@ -67,9 +67,12 @@ rejects duplicate ranking entries and predictions outside that frozen set.
 {"tweet_id": 123456789, "condition_id": "0x1234abcd", "predicted_grade": 3}
 ```
 
-Grades: 0 (`noise`), 1 (`commentary_reaction`), 2 (`speculation_rumor`), 3 (`indirect_report`), 4 (`strong_direct`), 5 (`resolving`)
+Grades: 0 (`noise`), 1 (`commentary`), 2 (`speculation`),
+3 (`indirect_report`), 4 (`strong_direct`), 5 (`resolving`). Canonical held-out
+evaluation uses the human-adjudicated `gold_grade` from the T3 `gold` split;
+silver `final_grade` results must be reported separately.
 
-**Primary metric:** QWK (kappa) | **Secondary:** `resolving`-class precision, macro-F1
+**Metrics:** Quadratic-weighted kappa, unweighted Cohen's kappa, macro-F1
 
 ### T4 -- Market Movement Prediction
 

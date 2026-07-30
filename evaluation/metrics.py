@@ -218,6 +218,45 @@ def quadratic_weighted_kappa(
 
 
 # ------------------------------------------------------------------ #
+#  Unweighted Cohen's Kappa                                           #
+# ------------------------------------------------------------------ #
+
+def cohen_kappa(
+    y_true: Sequence[int],
+    y_pred: Sequence[int],
+    num_classes: int,
+) -> float:
+    """Unweighted Cohen's kappa for classification.
+
+    Parameters
+    ----------
+    y_true, y_pred : sequence of int
+        Integer class indices in ``[0, num_classes)``.
+    num_classes : int
+        Number of classes.
+    """
+    n = len(y_true)
+    if n == 0:
+        return 0.0
+
+    hist_true = [0] * num_classes
+    hist_pred = [0] * num_classes
+    agree = 0
+    for t, p in zip(y_true, y_pred):
+        hist_true[t] += 1
+        hist_pred[p] += 1
+        if t == p:
+            agree += 1
+
+    po = agree / n
+    pe = sum(hist_true[i] * hist_pred[i] for i in range(num_classes)) / (n * n)
+
+    if pe == 1.0:
+        return 1.0
+    return (po - pe) / (1 - pe)
+
+
+# ------------------------------------------------------------------ #
 #  Mean Reciprocal Rank                                               #
 # ------------------------------------------------------------------ #
 

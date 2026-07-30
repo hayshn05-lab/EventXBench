@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
 """T3 LLM Grading Baseline -- Evidence Grading.
 
-Prompts an LLM to assign an evidence grade (0-5) for each tweet-market
-pair, then evaluates against the human-annotated final_grade using
-Spearman correlation and Quadratic Weighted Kappa (QWK).
+Prompts an LLM to assign an evidence grade (0-5) for each tweet-market pair.
+Prefers the human-adjudicated gold pool (T3_Reproducible_Package's 2,687-row
+audit pool, `gold_grade`) when the "gold" split is available; otherwise falls
+back to the silver `final_grade` test split with an explicit warning, since
+silver only agrees with gold at kappa_w=0.582 (metrics.md Phase 6) - the two
+are not interchangeable ground truth and must never be reported under the
+same label. Whichever field is actually used is recorded in each output row
+so results aren't silently conflated later.
+
+The resolution-condition text fed into the prompt prefers the raw `description`
+column (the market's original resolution rule) over the GPT-derived, condensed
+`predicate` field when both are available - using `predicate` reintroduces the
+same circularity concern documented for T3_Reproducible_Package's zero-/three-
+shot gold-grading script (grading against an artifact of the same extraction
+pipeline that helped produce the labels).
 
 Usage:
     python -m baselines.t3.llm_baseline --provider openai --model gpt-4o --shots 0
     python -m baselines.t3.llm_baseline --provider anthropic --model claude-sonnet-4-20250514 --shots 3
+    python -m baselines.t3.llm_baseline --split gold   # require the human-adjudicated pool
 """
 from __future__ import annotations
 
@@ -17,10 +30,10 @@ import os
 import re
 import time
 
-import numpy as np
 import pandas as pd
 
 import eventxbench
+from evaluation.metrics import cohen_kappa, macro_f1, quadratic_weighted_kappa, spearman_rho
 
 # ---------------------------------------------------------------------------
 # 0-shot system prompt
@@ -213,65 +226,40 @@ def _parse_grade(raw: str) -> int | None:
 
 
 # ---------------------------------------------------------------------------
-# Metrics
+# Data loading -- prefers the human-adjudicated gold pool
 # ---------------------------------------------------------------------------
-def _spearman(x: list[float], y: list[float]) -> float | None:
-    """Spearman rank correlation."""
-    n = len(x)
-    if n < 2:
-        return None
+def _load_t3_data(local_dir: str | None, split_mode: str) -> tuple[pd.DataFrame, str]:
+    """Load T3 data, preferring the gold-adjudicated pool.
 
-    def _rank(vals):
-        indexed = sorted(enumerate(vals), key=lambda p: p[1])
-        ranks = [0.0] * len(vals)
-        i = 0
-        while i < len(indexed):
-            j = i
-            while j + 1 < len(indexed) and indexed[j + 1][1] == indexed[i][1]:
-                j += 1
-            avg = (i + j + 2) / 2.0
-            for k in range(i, j + 1):
-                ranks[indexed[k][0]] = avg
-            i = j + 1
-        return ranks
+    split_mode:
+      "gold"   - require the gold split (raises if unavailable).
+      "silver" - force the silver `final_grade` test split.
+      "auto"   - try gold first, fall back to silver with a printed warning.
 
-    rx, ry = _rank(x), _rank(y)
-    mx = sum(rx) / n
-    my = sum(ry) / n
-    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
-    vx = sum((a - mx) ** 2 for a in rx)
-    vy = sum((b - my) ** 2 for b in ry)
-    if vx == 0 or vy == 0:
-        return None
-    return cov / (vx ** 0.5 * vy ** 0.5)
+    Returns (df, label_col) where label_col is "gold_grade" or "final_grade" -
+    callers must use this, not a hardcoded field name, so silver is never
+    mislabeled as gold in results.
+    """
+    if split_mode in ("gold", "auto"):
+        try:
+            df = eventxbench.load_task("t3", local_dir=local_dir, split="gold")
+            if isinstance(df, tuple):
+                df = df[1]
+            return df, "gold_grade"
+        except Exception as exc:
+            if split_mode == "gold":
+                raise
+            print(
+                f"NOTE: T3 'gold' split not available ({exc}) - falling back to the "
+                "silver 'final_grade' test split. Silver only agrees with the "
+                "human-adjudicated gold pool at kappa_w=0.582 (metrics.md Phase 6); "
+                "results here reflect fit-to-silver, not fit-to-ground-truth."
+            )
 
-
-def _quadratic_weighted_kappa(y_true: list[int], y_pred: list[int], num_classes: int = 6) -> float:
-    """Compute QWK for ordinal grades 0..num_classes-1."""
-    n = len(y_true)
-    if n == 0:
-        return 0.0
-    # Confusion matrix
-    O = np.zeros((num_classes, num_classes), dtype=float)
-    for t, p in zip(y_true, y_pred):
-        O[t][p] += 1
-
-    # Weight matrix (quadratic)
-    W = np.zeros((num_classes, num_classes), dtype=float)
-    for i in range(num_classes):
-        for j in range(num_classes):
-            W[i][j] = (i - j) ** 2 / (num_classes - 1) ** 2
-
-    # Expected matrix under independence
-    hist_true = O.sum(axis=1)
-    hist_pred = O.sum(axis=0)
-    E = np.outer(hist_true, hist_pred) / n
-
-    num = (W * O).sum()
-    den = (W * E).sum()
-    if den == 0:
-        return 1.0
-    return 1.0 - num / den
+    df = eventxbench.load_task("t3", local_dir=local_dir)
+    if isinstance(df, tuple):
+        df = df[1]
+    return df, "final_grade"
 
 
 # ---------------------------------------------------------------------------
@@ -290,14 +278,19 @@ def main() -> None:
     parser.add_argument("--delay", type=float, default=0.3)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--local-dir", default=None)
+    parser.add_argument(
+        "--split",
+        choices=["auto", "gold", "silver"],
+        default="auto",
+        help="'gold' = require the human-adjudicated audit pool; 'silver' = force "
+        "the final_grade test split; 'auto' (default) tries gold, falls back to silver.",
+    )
     args = parser.parse_args()
 
     # -- Load data ----------------------------------------------------------
-    df = eventxbench.load_task("t3", local_dir=args.local_dir)
-    if isinstance(df, tuple):
-        df = df[1]
+    df, label_col = _load_t3_data(args.local_dir, args.split)
 
-    required = {"tweet_id", "final_grade"}
+    required = {"tweet_id", label_col}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"Missing columns in T3 data: {missing}")
@@ -305,14 +298,34 @@ def main() -> None:
     # Determine text column names (may vary between data versions)
     tweet_col = "tweet" if "tweet" in df.columns else "tweet_text"
     question_col = "question" if "question" in df.columns else "market_question"
-    predicate_col = "predicate" if "predicate" in df.columns else "resolution_rule"
     if tweet_col not in df.columns or question_col not in df.columns:
         raise ValueError(
             f"Expected '{tweet_col}' and '{question_col}' columns in T3 data. "
             f"Found: {sorted(df.columns)}"
         )
 
-    print(f"T3 samples: {len(df)}, model: {args.model}, shots: {args.shots}")
+    # Prefer the raw resolution rule (`description`) over the GPT-derived,
+    # condensed `predicate` field - using the derived field reintroduces the
+    # circularity concern documented for the package's gold-grading script.
+    if "description" in df.columns:
+        resolution_col = "description"
+    elif "predicate" in df.columns:
+        resolution_col = "predicate"
+        print(
+            "WARNING: T3 data has no raw `description` (resolution rule) column - "
+            "falling back to the GPT-derived `predicate` field, which reintroduces "
+            "the circularity concern flagged for the gold-grading script (grading "
+            "against an artifact of the same pipeline that helped produce the labels)."
+        )
+    elif "resolution_rule" in df.columns:
+        resolution_col = "resolution_rule"
+    else:
+        raise ValueError(
+            f"Expected a 'description', 'predicate', or 'resolution_rule' column "
+            f"in T3 data. Found: {sorted(df.columns)}"
+        )
+
+    print(f"T3 samples: {len(df)}, model: {args.model}, shots: {args.shots}, label: {label_col}")
 
     if not args.dry_run:
         client = _make_client(args.provider)
@@ -325,15 +338,15 @@ def main() -> None:
     for i, (_, row) in enumerate(df.iterrows()):
         tweet = str(row[tweet_col])
         question = str(row[question_col])
-        predicate = str(row[predicate_col])
-        gold = int(row["final_grade"])
+        resolution_text = str(row[resolution_col])
+        gold = int(row[label_col])
 
         if args.shots == 0:
             system = SYSTEM_PROMPT
-            prompt = _build_prompt_0shot(tweet, question, predicate)
+            prompt = _build_prompt_0shot(tweet, question, resolution_text)
         else:
             system = SYSTEM_PROMPT_3SHOT
-            prompt = _build_prompt_3shot(tweet, question, predicate)
+            prompt = _build_prompt_3shot(tweet, question, resolution_text)
 
         if args.dry_run:
             print("=== SAMPLE PROMPT ===")
@@ -360,7 +373,8 @@ def main() -> None:
             {
                 "tweet_id": str(row["tweet_id"]),
                 "condition_id": str(row.get("condition_id", "")),
-                "gold_grade": gold,
+                label_col: gold,  # honest key: "gold_grade" only when label_col IS gold_grade
+                "label_source": label_col,
                 "predicted_grade": grade,
                 "llm_raw": raw,
             }
@@ -368,20 +382,28 @@ def main() -> None:
 
         n = len(results)
         if n % 50 == 0:
-            rho = _spearman([float(v) for v in y_true], [float(v) for v in y_pred])
-            rho_str = f"{rho:.4f}" if rho is not None else "N/A"
-            print(f"  [{n}/{len(df)}] Spearman={rho_str}  parse_errors={parse_errors}")
+            rho = spearman_rho([float(v) for v in y_true], [float(v) for v in y_pred])
+            print(f"  [{n}/{len(df)}] Spearman={rho:.4f}  parse_errors={parse_errors}")
 
         time.sleep(args.delay)
 
     # -- Report -------------------------------------------------------------
     if results:
-        rho = _spearman([float(v) for v in y_true], [float(v) for v in y_pred])
-        qwk = _quadratic_weighted_kappa(y_true, y_pred, num_classes=6)
-        rho_str = f"{rho:.4f}" if rho is not None else "N/A"
+        kappa_u = cohen_kappa(y_true, y_pred, num_classes=6)
+        kappa_w = quadratic_weighted_kappa(y_true, y_pred, num_classes=6)
+        f1 = macro_f1(y_true, y_pred)
+        rho = spearman_rho([float(v) for v in y_true], [float(v) for v in y_pred])
 
-        print(f"\n=== Results ({args.model}, {args.shots}-shot) ===")
-        print(f"  N={len(results)}, Spearman={rho_str}, QWK={qwk:.4f}, parse_errors={parse_errors}")
+        print(f"\n=== Results ({args.model}, {args.shots}-shot, vs. {label_col}) ===")
+        print(
+            f"  N={len(results)}, kappa_u={kappa_u:.4f}, kappa_w={kappa_w:.4f}, "
+            f"macro_f1={f1:.4f}, Spearman={rho:.4f}, parse_errors={parse_errors}"
+        )
+        if label_col == "final_grade":
+            print(
+                "  NOTE: scored against silver (final_grade), not human-adjudicated "
+                "gold_grade - see metrics.md Phase 6 (kappa_w=0.582 silver-vs-gold)."
+            )
 
         with open(args.output, "w", encoding="utf-8") as f:
             for r in results:

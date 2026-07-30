@@ -34,6 +34,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from evaluation.metrics import (
     accuracy,
+    cohen_kappa,
     derive_direction_magnitude,
     direction_accuracy,
     macro_f1,
@@ -97,7 +98,11 @@ def _load_gold(
         sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
         from eventxbench import load_task  # type: ignore
 
-        ds = load_task(task, split="test")
+        # T3's held-out human adjudication is a distinct ``gold`` split.
+        # Requesting ``test`` would either fail on the v2 builder or silently
+        # score the legacy silver export as if it were human ground truth.
+        hosted_split = "gold" if task == "t3" else "test"
+        ds = load_task(task, split=hosted_split)
         if hasattr(ds, "to_dict"):
             try:
                 records = ds.to_dict("records")
@@ -369,11 +374,19 @@ def evaluate_t2(preds: List[dict], gold: List[dict]) -> Dict[str, Any]:
 
 
 def evaluate_t3(preds: List[dict], gold: List[dict]) -> Dict[str, Any]:
-    # Build key -> grade map from gold
+    # Prefer the human-adjudicated `gold_grade` (the 2,687-instance audit pool)
+    # when present; fall back to the silver `final_grade` otherwise. The two
+    # are NOT interchangeable ground truth - silver only agrees with gold at
+    # kappa_w=0.582 (T3_Reproducible_Package metrics.md, Phase 6), below the
+    # project's own 0.6 reliability bar. `gold_field` in the result records
+    # which one was actually used, so results scored against each aren't
+    # silently conflated.
     gold_map: dict[str, int] = {}
+    gold_field = "gold_grade" if gold and "gold_grade" in gold[0] else "final_grade"
     for g in gold:
         key = f"{g['tweet_id']}_{g['condition_id']}"
-        gold_map[key] = int(g["final_grade"])
+        field = "gold_grade" if "gold_grade" in g else "final_grade"
+        gold_map[key] = int(g[field])
 
     y_true, y_pred = [], []
     for p in preds:
@@ -385,9 +398,12 @@ def evaluate_t3(preds: List[dict], gold: List[dict]) -> Dict[str, Any]:
     num_classes = 6  # grades 0-5
     return {
         "task": "t3",
+        "gold_field": gold_field,
         "n": len(y_true),
+        "kappa_unweighted": round(cohen_kappa(y_true, y_pred, num_classes), 4),
+        "kappa_weighted": round(quadratic_weighted_kappa(y_true, y_pred, num_classes), 4),
+        "macro_f1": round(macro_f1(y_true, y_pred), 4),
         "spearman_rho": round(spearman_rho(y_true, y_pred), 4),
-        "qwk": round(quadratic_weighted_kappa(y_true, y_pred, num_classes), 4),
     }
 
 

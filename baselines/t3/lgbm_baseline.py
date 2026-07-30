@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
 """T3 LightGBM Baseline -- Evidence Grading (Inference-Only).
 
-Loads precomputed tweet and market embeddings and trains LightGBM classifier.
-Reports Cohen's Kappa and Macro F1.
+Loads precomputed tweet and predicate embeddings and trains a LightGBM
+classifier on [requires_official, tweet_embedding, predicate_embedding].
+Reports Cohen's Kappa and Macro F1. Predicate embeddings are deduplicated
+(predicates repeat heavily across rows) and reconstructed per-row via
+predicate_indices - see T3_Reproducible_Package/embeddings/.
 
 Usage:
     python t3_lgbm_inference.py
     python t3_lgbm_inference.py --local-dir /path/to/data
-    python t3_lgbm_inference.py --tweet-emb tweet_embeddings.npy --market-emb market_embeddings.npy
+    python t3_lgbm_inference.py --tweet-emb tweet_embeddings.npy \\
+        --predicate-emb predicate_embeddings.npy --predicate-idx predicate_indices.npy
 """
 from __future__ import annotations
 
@@ -18,7 +22,6 @@ import pandas as pd
 import lightgbm as lgb
 from sklearn.metrics import cohen_kappa_score, f1_score
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import LabelEncoder
 
 import eventxbench
 
@@ -26,35 +29,22 @@ import eventxbench
 # ---------------------------------------------------------------------------
 # Feature construction
 # ---------------------------------------------------------------------------
-RULE_COLS = [
-    "check_source",
-    "check_time",
-    "check_threshold",
-    "check_predicate",
-    "candidate_grade",
-    "requires_official",
-    "needs_llm",
-]
-
-CAT_COLS = ["check_source", "check_time", "check_threshold", "check_predicate"]
-
-
+# Matches T3_Reproducible_Package's canonical LightGBM baseline exactly
+# (t3_baselines_majority_random_lightgbm.ipynb, cell 9): requires_official +
+# tweet embeddings + predicate embeddings ONLY. The four deterministic
+# check_* columns, candidate_grade, and needs_llm are deliberately excluded -
+# they are what *produce* final_grade for the auto-labeled rows and are
+# heavily correlated with it elsewhere, so including them as model features
+# is close to label leakage rather than an honest baseline.
 def build_features(
     df: pd.DataFrame,
     tweet_embeddings: np.ndarray,
-    market_embeddings: np.ndarray,
+    predicate_embeddings: np.ndarray,
+    predicate_indices: np.ndarray,
 ) -> np.ndarray:
-    rule_df = df[RULE_COLS].copy()
-
-    le = LabelEncoder()
-    for col in CAT_COLS:
-        rule_df[col] = le.fit_transform(rule_df[col].astype(str))
-
-    rule_df["requires_official"] = rule_df["requires_official"].astype(int)
-    rule_df["needs_llm"] = rule_df["needs_llm"].astype(int)
-    rule_df["candidate_grade"] = rule_df["candidate_grade"].fillna(3)
-
-    return np.hstack([rule_df.values, tweet_embeddings, market_embeddings])
+    requires_official = df["requires_official"].astype(int).values.reshape(-1, 1)
+    predicate_matrix = predicate_embeddings[predicate_indices]
+    return np.hstack([requires_official, tweet_embeddings, predicate_matrix])
 
 
 # ---------------------------------------------------------------------------
@@ -105,7 +95,17 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="T3 LightGBM baseline (Inference Only)")
     parser.add_argument("--local-dir", default=None)
     parser.add_argument("--tweet-emb", default="tweet_embeddings.npy")
-    parser.add_argument("--market-emb", default="market_embeddings.npy")
+    parser.add_argument(
+        "--predicate-emb",
+        default="predicate_embeddings.npy",
+        help="Deduplicated predicate-text embeddings (one row per unique predicate).",
+    )
+    parser.add_argument(
+        "--predicate-idx",
+        default="predicate_indices.npy",
+        help="Per-row index into --predicate-emb; predicate_emb[predicate_idx] "
+        "reconstructs the full per-row predicate embedding matrix.",
+    )
     parser.add_argument("--test-size", type=float, default=0.3)
     parser.add_argument("--random-state", type=int, default=42)
     args = parser.parse_args()
@@ -115,20 +115,24 @@ def main() -> None:
     if isinstance(df, tuple):
         df = df[1]
 
-    df["predicate_text"] = df["predicate"].fillna(df["market"])
-
     print(f"T3 samples: {len(df)}")
     print(f"Grade distribution: {dict(sorted(Counter(df['final_grade'].tolist()).items()))}")
 
     # Load precomputed embeddings
     print(f"\nLoading embeddings from disk...")
     tweet_embeddings = np.load(args.tweet_emb)
-    market_embeddings = np.load(args.market_emb)
-    print(f"Tweet embeddings shape:  {tweet_embeddings.shape}")
-    print(f"Market embeddings shape: {market_embeddings.shape}")
+    predicate_embeddings = np.load(args.predicate_emb)
+    predicate_indices = np.load(args.predicate_idx)
+    print(f"Tweet embeddings shape:     {tweet_embeddings.shape}")
+    print(f"Predicate embeddings shape: {predicate_embeddings.shape} (deduplicated)")
+    print(f"Predicate indices shape:    {predicate_indices.shape}")
+    assert len(df) == tweet_embeddings.shape[0] == predicate_indices.shape[0], (
+        "Row count mismatch between T3 data and embeddings - "
+        "these must be in the same row order."
+    )
 
     # Features
-    X = build_features(df, tweet_embeddings, market_embeddings)
+    X = build_features(df, tweet_embeddings, predicate_embeddings, predicate_indices)
     y = df["final_grade"].values
     print(f"Feature matrix shape: {X.shape}")
 

@@ -1,9 +1,11 @@
 # EventX Leaderboard
 
-Results reported on the frozen test splits of the named release. Values below
-are included only when a matching frozen report or reproducible packaged
-prediction file is available; results from superseded schemas are not carried
-forward.
+Results use the named release's frozen evaluation contract: `test` for the
+non-T3 canonical tasks and the human-adjudicated `gold` audit split for T3.
+The explicitly labeled T3 non-LLM references instead use the package's
+documented 70/30 silver split. Values below are included only when a matching
+frozen report or reproducible packaged prediction file is available; results
+from superseded schemas are not carried forward.
 
 ## Resolution Tier
 
@@ -23,23 +25,47 @@ The contextual LLM runner is included in `baselines/t2`; no LLM row is copied
 from the older T2 contract. The deterministic rows above are reproduced by
 `python -m baselines.t2.contextual_baselines`.
 
-### T3: Evidence Grading
+### T3: Evidence Grading vs. Human Gold (2,687-instance gold audit pool)
 
-| Model | QWK (kappa) | Macro-F1 |
-|-------|-------------|----------|
-| Pre-check pipeline | 0.686 | 0.320 |
-| LightGBM | **0.849** | **0.489** |
-| GPT-4o (0-shot) | 0.080 | 0.274 |
-| GPT-4o (3-shot) | 0.106 | 0.312 |
-| GPT-4o + image | 0.103 | 0.170 |
-| Sonnet 4.5 (0-shot) | 0.132 | 0.237 |
-| Sonnet 4.5 (3-shot) | 0.172 | 0.285 |
-| Grok 4.1 (0-shot) | 0.100 | 0.198 |
-| Grok 4.1 (3-shot) | 0.174 | 0.301 |
-| Qwen3.5-4B (0-shot) | 0.126 | 0.199 |
-| Qwen3.5-4B (3-shot) | 0.192 | 0.287 |
-| Qwen3.5-27B (0-shot) | 0.210 | 0.292 |
-| Qwen3.5-27B (3-shot) | 0.214 | 0.315 |
+Evaluated against the human-adjudicated `gold_grade` (T3_Reproducible_Package's
+2,687-instance, rare-grade-enriched audit pool) - **not** silver `final_grade`.
+The two are not interchangeable ground truth; see `data/README.md`.
+
+**Anchors:** silver pipeline κ_w = 0.582 (fails the project's own 0.6 reliability
+bar); human inter-annotator agreement κ_w = 0.775–0.848 (`metrics.md` Phase 5).
+κ_w / κ_u = quadratic-weighted / unweighted Cohen's κ. Models served via
+provider APIs.
+
+| Model | 0-shot κ_w | 0-shot κ_u | 0-shot F1 | 3-shot κ_w | 3-shot κ_u | 3-shot F1 |
+|-------|-----------|-----------|-----------|-----------|-----------|-----------|
+| Gemma-4-26B | 0.652 | 0.230 | 0.331 | 0.688 | 0.323 | 0.417 |
+| GPT-4o | 0.659 | 0.190 | 0.288 | 0.699 | 0.221 | 0.330 |
+| Grok-4.5 | 0.637 | 0.197 | 0.306 | **0.774** | **0.416** | **0.447** |
+| Qwen3.6-35B | 0.564 | 0.266 | 0.360 | 0.663 | 0.349 | 0.430 |
+| DeepSeek-V3 | 0.645 | 0.213 | 0.304 | 0.618 | 0.331 | 0.421 |
+| Claude Sonnet-5 | 0.564 | 0.247 | 0.328 | 0.539 | 0.264 | 0.344 |
+
+Even the best 3-shot result (Grok-4.5, κ_w 0.774) sits below the human IAA
+floor (0.775–0.848) and only modestly above the silver pipeline's own
+agreement with gold (κ_w 0.582) - evidence grading remains unsolved at the
+gold standard, and 3-shot doesn't reliably help (Claude Sonnet-5, DeepSeek-V3
+both *regress* on κ_w with 3-shot).
+
+#### Non-LLM baselines vs. silver (`final_grade`, 70/30 market-level split, `random_state=42`)
+
+| Method | Kappa (unweighted) | Macro-F1 |
+|--------|---------------------|----------|
+| Majority | 0.0000 | 0.0853 |
+| Random (single seed=42) | 0.0038 | 0.1709 |
+| LightGBM (`requires_official` + tweet/predicate embeddings) | 0.4562 | 0.3963 |
+
+Reference numbers from `T3_Reproducible_Package/metrics.md` Phase 6 - pending
+re-run in this repo with the corrected `baselines/t3/basic_baseline.py` /
+`lgbm_baseline.py` once the underlying data files are rebuilt. **The previous
+"Pre-check pipeline: 0.686 QWK" / "LightGBM: 0.849 QWK" rows here were removed**
+- they were produced by a mislabeled auto-grade shortcut and a feature set that
+included near-label-leaking deterministic-check columns, both fixed on this
+branch; those old numbers should not be cited.
 
 ## Forecast Tier
 

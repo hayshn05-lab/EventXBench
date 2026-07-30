@@ -36,7 +36,8 @@ _URLS = {
     "t2_train": "data/t2/t2_train.jsonl",
     "t2_validation": "data/t2/t2_val.jsonl",
     "t2_test": "data/t2/t2_test.jsonl",
-    "t3_test": "data/t3/test.jsonl",
+    "t3_train": "data/t3/train.jsonl",
+    "t3_gold": "data/t3/gold.jsonl",
     "t4_train": "data/t4/train.jsonl",
     "t4_validation": "data/t4/validation.jsonl",
     "t4_test": "data/t4/test.jsonl",
@@ -77,7 +78,12 @@ class EventXBench(datasets.GeneratorBasedBuilder):
         EventXBenchConfig(
             name="t3",
             version=VERSION,
-            description="T3: Evidence Grading (ordinal 0-5)",
+            description=(
+                "T3: Evidence Grading (ordinal 0-5). 'train' split = full "
+                "silver-labeled export (final_grade); 'gold' split = the "
+                "separate, rare-grade-enriched, human-adjudicated audit pool "
+                "(gold_grade) - the actual held-out ground truth."
+            ),
         ),
         EventXBenchConfig(
             name="t4",
@@ -128,6 +134,7 @@ class EventXBench(datasets.GeneratorBasedBuilder):
         train_key = f"{config}_train"
         validation_key = f"{config}_validation"
         test_key = f"{config}_test"
+        gold_key = f"{config}_gold"
 
         if train_key in downloaded:
             splits.append(
@@ -148,6 +155,15 @@ class EventXBench(datasets.GeneratorBasedBuilder):
                 datasets.SplitGenerator(
                     name=datasets.Split.TEST,
                     gen_kwargs={"filepath": downloaded[test_key]},
+                )
+            )
+        if gold_key in downloaded:
+            # Custom named split - human-adjudicated audit pool (T3 only).
+            # Not a train/validation/test split; do not conflate with TEST.
+            splits.append(
+                datasets.SplitGenerator(
+                    name=datasets.NamedSplit("gold"),
+                    gen_kwargs={"filepath": downloaded[gold_key]},
                 )
             )
 

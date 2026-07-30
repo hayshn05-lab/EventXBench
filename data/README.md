@@ -33,7 +33,8 @@ A multimodal benchmark linking 9M Twitter/X posts to 11,952 Polymarket predictio
 
 EventX connects social media posts on Twitter/X to prediction-market dynamics on Polymarket. The current release provides six canonical tasks spanning two tiers:
 
-- **Resolution tier** (human-annotated): Post-to-Market Linking (T2), Evidence Grading (T3)
+- **Resolution tier**: Post-to-Market Linking (T2) and Evidence Grading (T3);
+  T3 trains on silver labels and evaluates on a separate human-adjudicated audit split
 - **Forecast tier** (causally constructed labels): Market Volume Prediction (T1), Daily Market Movement (T4), Forward Drift & Persistence (T5), Cross-Market Co-Movement (T6)
 
 ### Supported Tasks
@@ -42,7 +43,7 @@ EventX connects social media posts on Twitter/X to prediction-market dynamics on
 |--------|------|------|-------------|
 | `t1` | Market Volume Prediction | 984 | Predict lifetime-volume interest from pre-market evidence |
 | `t2` | Post-to-Market Linking | 5,544 | Rank a contextual market candidate or select `NONE` |
-| `t3` | Evidence Grading | 342,552 | Grade tweet relevance to a market (0-5) |
+| `t3` | Evidence Grading | 279,924 (`train`, silver); 2,687 overlapping `gold` audit rows | Grade tweet relevance to a market (0-5) |
 | `t4` | Daily Market Movement | 10,934 | Predict direction, magnitude, and 1/3/7-day price deltas |
 | `t5` | Forward Drift & Persistence | 3,342 | Predict drift, volume multiplier, and decay |
 | `t6` | Cross-Market Co-Movement | 4,583 | Predict 1/3/7-day sibling-market co-movement |
@@ -53,11 +54,12 @@ EventX connects social media posts on Twitter/X to prediction-market dynamics on
 
 ### Usage
 
-> **Publishing status (2026-07-29):** the hosted
+> **Publishing status (2026-07-30):** the hosted
 > `mlsys-io/EventXBench` repository is gated and still contains the earlier
-> task schemas. The July 2026 v2 files described below are distributed in the
-> dated maintainer release bundles and must be loaded from explicit local
-> paths until the hosted configs are replaced.
+> task schemas, including only legacy T3 silver labels rather than the new
+> human `gold` split. The July 2026 v2 files described below are distributed
+> in the dated maintainer release bundles and must be loaded from explicit
+> local paths until the hosted configs are replaced.
 
 ```python
 from eventxbench import load_task
@@ -82,17 +84,20 @@ ds = load_dataset("mlsys-io/EventXBench", "t1")
 
 ### Release and Split Contracts
 
-| Config | Version | Train | Validation | Test |
-|--------|---------|------:|-----------:|-----:|
-| `t1` | `t1.kdd.v2` | 709 | -- | 275 |
-| `t2` | `t2.gold.r3.contextual.v1` | 544 | 2,500 | 2,500 |
-| `t4` | `t4.kdd.v2` | 2,875 | 2,268 | 5,791 |
-| `t5` | `t5.kdd.v2` | 889 | 692 | 1,761 |
-| `t6` | `t6.kdd.v2` | 766 | 1,225 | 2,592 |
+| Config | Version | Train | Validation | Test | Gold |
+|--------|---------|------:|-----------:|-----:|-----:|
+| `t1` | `t1.kdd.v2` | 709 | -- | 275 | -- |
+| `t2` | `t2.gold.r3.contextual.v1` | 544 | 2,500 | 2,500 | -- |
+| `t3` | `T3_Reproducible_Package` | 279,924 | -- | -- | 2,687 |
+| `t4` | `t4.kdd.v2` | 2,875 | 2,268 | 5,791 | -- |
+| `t5` | `t5.kdd.v2` | 889 | 692 | 1,761 | -- |
+| `t6` | `t6.kdd.v2` | 766 | 1,225 | 2,592 | -- |
 
 T1 uses a purged group-atomic temporal train/test split. T4--T6 use
 `tier2.temporal.v2`; T6 is also event-cluster grouped. Validation is for model
 selection, and sealed test access in the LLM runners requires `--allow-test`.
+T3's gold rows overlap the silver export and are a distinct evaluation
+contract, not an additive split count.
 
 ## Data Fields
 
@@ -121,14 +126,39 @@ selection, and sealed test access in the LLM runners requires `--allow-test`.
 
 ### T3: Evidence Grading
 
+Two splits, not interchangeable ground truth: `train` is the full silver
+export (279,924 rows, named "train" because baselines self-split it 70/30
+by `condition_id` at runtime rather than treating it as held-out); `gold`
+is a separate, rare-grade-enriched, human-adjudicated audit pool (2,687
+rows) sampled from the silver export - the actual held-out ground truth.
+Silver agrees with gold at only kappa_w=0.582 (fails the project's own 0.6
+reliability bar) - see the T3_Reproducible_Package `metrics.md`, Phase 6.
+
+`train` (silver) split:
 - `tweet_id` (int): Twitter post ID
 - `condition_id` (str): Polymarket condition ID
 - `tweet` (str): Tweet text
-- `market` (str): Market metadata
 - `question` (str): Market question
-- `final_grade` (int): Evidence grade 0-5
-- `llm_grade` (int): LLM-assigned grade
+- `description` (str): Raw resolution rule text
+- `predicate` (str): GPT-derived, condensed resolution condition
+- `deadline` (str): Market resolution deadline
+- `requires_official` (bool): Whether an official/whitelisted source is required for grade 5
+- `final_grade` (int): Evidence grade 0-5 (silver, not human-adjudicated)
+- `label_source` (str): `auto` (all 4 deterministic checks passed) or `llm` (model-graded) -
+  **no `human` value exists in this split**; human annotation only occurs in the separate `gold` split below
+- `candidate_grade` (int): Deterministic auto-grade (5) when all 4 checks passed; NaN otherwise
+- `llm_grade` (int): LLM-assigned grade (NaN for `auto` rows)
 - `llm_confidence` (float): LLM confidence score
+- `check_source` (str): `pass`/`fail`/`uncertain` - source-authority pre-check result
+- `created_at` (str): Tweet publication timestamp
+
+`gold` (human-adjudicated audit pool) split:
+- `tweet_id`, `condition_id`: as above
+- `tweet`, `question`, `description`: same meaning as in `train` (this split carries its own
+  copy of the text, not just IDs - it's queried directly for LLM grading, not joined from `train`)
+- `gold_grade` (int): Evidence grade 0-5, resolved from 3 independent human annotators
+  via majority vote / pair agreement / senior adjudication
+- `resolution_method` (str): `majority_vote_2of3`, `pair_agreement`, or `senior_adjudication`
 
 ### T4: Market Movement Prediction
 
@@ -165,7 +195,9 @@ selection, and sealed test access in the LLM runners requires `--allow-test`.
 
 ## Privacy and Ethics
 
-- **Tweet text**: Stripped from the public release per Twitter/X ToS. Tweet IDs are provided for authorized rehydration.
+- **Tweet text**: The general ~9M-post corpus strips text and provides IDs for
+  authorized rehydration. The gated T3 supervised artifacts include their
+  task-specific `tweet` field under the dataset access conditions.
 - **Market data**: Polymarket data is publicly available on-chain and included under fair use for research.
 - **No PII**: User-level features are aggregated; no individual user profiles are released.
 

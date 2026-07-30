@@ -272,16 +272,23 @@ class EvaluationAlignmentTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Invalid T6 v2 prediction"):
             evaluate_t6(predictions, gold)
 
-    def test_t3_behavior_is_preserved(self) -> None:
-        gold = [{"tweet_id": "1", "condition_id": "a", "final_grade": 4}]
+    def test_t3_silver_and_gold_behavior_from_upstream_is_preserved(self) -> None:
+        silver = [{"tweet_id": "1", "condition_id": "a", "final_grade": 4}]
         predictions = [
             {"tweet_id": "1", "condition_id": "a", "predicted_grade": 4}
         ]
 
-        result = evaluate_t3(predictions, gold)
+        silver_result = evaluate_t3(predictions, silver)
+        gold_result = evaluate_t3(
+            predictions,
+            [{"tweet_id": "1", "condition_id": "a", "gold_grade": 4}],
+        )
 
-        self.assertEqual(result["task"], "t3")
-        self.assertEqual(result["n"], 1)
+        self.assertEqual(silver_result["task"], "t3")
+        self.assertEqual(silver_result["gold_field"], "final_grade")
+        self.assertEqual(silver_result["n"], 1)
+        self.assertEqual(gold_result["gold_field"], "gold_grade")
+        self.assertEqual(gold_result["n"], 1)
 
     def test_t2_accepts_contextual_runner_output_and_none_convention(self) -> None:
         gold = [
@@ -500,6 +507,18 @@ class EvaluationAlignmentTests(unittest.TestCase):
 
 
 class LoaderAlignmentTests(unittest.TestCase):
+    def test_hosted_t3_gold_loader_requests_gold_split(self) -> None:
+        import pandas as pd
+
+        frame = pd.DataFrame(
+            [{"tweet_id": "1", "condition_id": "a", "gold_grade": 4}]
+        )
+        with patch("eventxbench.load_task", return_value=frame) as load_task_mock:
+            records = _load_gold("t3", None, allow_hosted=True)
+
+        load_task_mock.assert_called_once_with("t3", split="gold")
+        self.assertEqual(records, frame.to_dict("records"))
+
     def test_hosted_gold_loader_converts_dataframe_records(self) -> None:
         import pandas as pd
 
@@ -525,6 +544,36 @@ class LoaderAlignmentTests(unittest.TestCase):
             loaded = load_task("t4", local_dir=str(root), split="val")
 
         self.assertEqual(loaded.to_dict("records"), [row])
+
+    def test_t3_prepared_layout_supports_train_and_gold_splits(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_dir = root / "t3"
+            task_dir.mkdir()
+            train_row = {
+                "tweet_id": "1",
+                "condition_id": "a",
+                "final_grade": 4,
+            }
+            gold_row = {
+                "tweet_id": "1",
+                "condition_id": "a",
+                "gold_grade": 4,
+            }
+            (task_dir / "train.jsonl").write_text(
+                json.dumps(train_row) + "\n", encoding="utf-8"
+            )
+            (task_dir / "gold.jsonl").write_text(
+                json.dumps(gold_row) + "\n", encoding="utf-8"
+            )
+
+            default_split = load_task("t3", local_dir=str(root))
+            train_split = load_task("t3", local_dir=str(root), split="train")
+            gold_split = load_task("t3", local_dir=str(root), split="gold")
+
+        self.assertEqual(default_split.to_dict("records"), [train_row])
+        self.assertEqual(train_split.to_dict("records"), [train_row])
+        self.assertEqual(gold_split.to_dict("records"), [gold_row])
 
 
 class GroupSafeCvTests(unittest.TestCase):

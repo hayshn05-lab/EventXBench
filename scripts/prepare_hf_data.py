@@ -74,7 +74,15 @@ def prepare_t2(source: Path, output: Path):
 
 
 def prepare_t3(source: Path, output: Path):
-    """T3: Test-only (resolution tier). Large JSON array."""
+    """T3: silver export (`train` split) + human-adjudicated gold audit pool
+    (`gold` split) - NOT a train/test pair in the conventional sense; baselines
+    self-split the silver export 70/30 by condition_id at runtime, and `gold`
+    is the actual held-out ground truth. See T3_Reproducible_Package.
+
+    NOTE: gold-pool preparation (source/task3/t3_gold_pool.json -> `gold`
+    split) is not wired up in this script yet - add it here once the raw
+    gold-pool source file's layout is finalized.
+    """
     print("\n[T3] Evidence Grading")
     with open(source / "task3" / "t3_final_graded.json", "r") as f:
         rows = json.load(f)
@@ -82,11 +90,11 @@ def prepare_t3(source: Path, output: Path):
         rows = list(rows.values())
 
     # Write as JSONL for streaming compatibility
-    write_jsonl(rows, output / "t3" / "test.jsonl")
+    write_jsonl(rows, output / "t3" / "train.jsonl")
 
     grades = Counter(r.get("final_grade") for r in rows)
     print(f"  Grade distribution: {dict(sorted(grades.items()))}")
-    return {"task": "t3", "test": len(rows), "grades": dict(sorted(grades.items()))}
+    return {"task": "t3", "train": len(rows), "grades": dict(sorted(grades.items()))}
 
 
 def prepare_t4(source: Path, output: Path):

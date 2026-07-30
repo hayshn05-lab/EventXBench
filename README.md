@@ -31,7 +31,7 @@ python evaluation/evaluate.py --task t1 \
 |------|------|------|--------|-----------------|
 | T1 | Market Volume Prediction | Forecast | 3-class interest label | Macro-F1, `high_interest` P@K |
 | T2 | Post-to-Market Linking | Resolution | Market ID or `NONE` | Accuracy@1, MRR, `NONE` F1 |
-| T3 | Evidence Grading | Resolution | Ordinal 0--5 | QWK (kappa), macro-F1 |
+| T3 | Evidence Grading | Resolution | Ordinal 0--5 | Quadratic-weighted kappa, unweighted Cohen's kappa, macro-F1 |
 | T4 | Daily Market Movement | Forecast | Direction, magnitude, 1/3/7-day deltas | Dir-Acc, Mag-F1, Spearman rho by horizon |
 | T5 | Forward Drift & Persistence | Forecast | 1/3/7-day drift/volume plus decay class | Spearman rho by horizon, decay Macro-F1 |
 | T6 | Cross-Market Co-Movement | Forecast | 3-class by 1/3/7-day horizon | Macro-F1, accuracy |
@@ -57,8 +57,9 @@ Given a post and a frozen contextual candidate set, rank the matching market or 
 ### T3: Evidence Grading and Resolution Potential
 Assign an ordinal evidence grade (0--5) to each post-market pair.
 
-- **Grade scale**: 0 (`noise`), 1 (`commentary_reaction`), 2 (`speculation_rumor`), 3 (`indirect_report`), 4 (`strong_direct`), 5 (`resolving`)
-- **Metrics**: Quadratic-weighted kappa, `resolving`-class precision, macro-F1
+- **Grade scale**: 0 (`noise`), 1 (`commentary`), 2 (`speculation`), 3 (`indirect_report`), 4 (`strong_direct`), 5 (`resolving`) - names match the frozen rubric (`t3_annotation_rubric.md`) used by both LLM and human graders
+- **Metrics**: Quadratic-weighted and unweighted kappa, macro-F1
+- **Ground truth**: silver `final_grade` (`train` split, 279,924 rows, deterministic-checks-then-LLM) vs. a separate 2,687-row human-adjudicated `gold_grade` audit pool (`gold` split). Silver only agrees with gold at kappa_w=0.582, below the project's 0.6 reliability bar - see `T3_Reproducible_Package/metrics.md` Phase 6
 
 ### T4: Market Movement Prediction
 Predict forward YES-price movement for a market-day post bundle.
@@ -143,10 +144,14 @@ test labels sealed for model selection and threshold tuning.
 |---------------|-------------|-----:|
 | `t1` (`t1.kdd.v2`) | 709 train / 275 test markets | 984 |
 | `t2` (`t2.gold.r3.contextual.v1`) | 544 train / 2,500 validation / 2,500 test | 5,544 |
-| `t3_graded.json` | T3 evidence grades (0--5) | 342,552 |
+| `t3` silver (`train`) | T3 evidence grades (0--5; `final_grade`) | 279,924 |
+| `t3` human audit (`gold`) | T3 human-adjudicated grades (`gold_grade`) | 2,687 |
 | `t4` (`t4.kdd.v2`) | 2,875 train / 2,268 validation / 5,791 test | 10,934 |
 | `t5` (`t5.kdd.v2`) | 889 train / 692 validation / 1,761 test | 3,342 |
 | `t6` (`t6.kdd.v2`) | 766 train / 1,225 validation / 2,592 test | 4,583 |
+
+The 2,687-row T3 `gold` audit pool is sampled from the silver export, so its
+count overlaps the 279,924-row `train` export and must not be added to it.
 
 Versioned KDD directories also contain a `manifest.json` (and, where
 applicable, a schema) that freezes counts, hashes, split policy, allowed input
